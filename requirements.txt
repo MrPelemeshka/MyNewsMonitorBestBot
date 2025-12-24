@@ -1,0 +1,7 @@
+aiogram
+python-dotenv
+aiohttp
+aiohttp-socks
+telethon
+beautifulsoup4
+lxml
