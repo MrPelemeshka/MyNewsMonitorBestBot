@@ -283,6 +283,33 @@ class NewsBotDB:
         )
         self.conn.commit()
     
+    def get_channels_paginated(self, user_id: int, page: int = 1, per_page: int = 8):
+        #Получение каналов с пагинацией
+        cursor = self.conn.cursor()
+        offset = (page - 1) * per_page
+        
+        # Получаем каналы для страницы
+        cursor.execute(
+            "SELECT channel_username FROM user_channels WHERE user_id = ? AND is_active = 1 ORDER BY added_at LIMIT ? OFFSET ?",
+            (user_id, per_page, offset)
+        )
+        channels = [row[0] for row in cursor.fetchall()]
+        
+        # Получаем общее количество
+        cursor.execute(
+            "SELECT COUNT(*) FROM user_channels WHERE user_id = ? AND is_active = 1",
+            (user_id,)
+        )
+        total = cursor.fetchone()[0]
+        
+        return {
+            'channels': channels,
+            'total': total,
+            'page': page,
+            'per_page': per_page,
+            'total_pages': (total + per_page - 1) // per_page
+        }
+    
     # === Методы для каналов ===
     def add_channel(self, user_id: int, channel: str) -> bool:
         cursor = self.conn.cursor()
@@ -946,11 +973,13 @@ async def main():
     
     @dp.message(F.text == "📢 Мои каналы")
     async def cmd_my_channels(message: Message):
-        """Показать каналы пользователя"""
+        """Показать каналы пользователя с пагинацией"""
         user_id = message.from_user.id
-        channels = db.get_channels(user_id)
         
-        if not channels:
+        # Получаем первую страницу каналов
+        data = db.get_channels_paginated(user_id, page=1, per_page=8)
+        
+        if not data['channels']:
             await message.answer(
                 "📭 <b>У вас нет каналов</b>\n\n"
                 "Добавьте каналы через кнопку '➕ Добавить канал'\n\n"
@@ -960,9 +989,9 @@ async def main():
             )
             return
         
-        # Создаем кнопки для каналов
+        # Создаем кнопки для каналов (максимум 8 на страницу)
         buttons = []
-        for channel in channels[:8]:  # Ограничиваем 8 каналами
+        for channel in data['channels']:
             buttons.append([
                 InlineKeyboardButton(
                     text=f"📢 @{channel}",
@@ -974,6 +1003,27 @@ async def main():
                 )
             ])
         
+        # Добавляем кнопки пагинации, если есть несколько страниц
+        navigation_buttons = []
+        
+        if data['total_pages'] > 1:
+            if data['page'] > 1:
+                navigation_buttons.append(
+                    InlineKeyboardButton(text="⬅️ Назад", callback_data=f"channels_page:{data['page'] - 1}")
+                )
+            
+            # Показываем номер страницы
+            navigation_buttons.append(
+                InlineKeyboardButton(text=f"{data['page']}/{data['total_pages']}", callback_data="noop")
+            )
+            
+            if data['page'] < data['total_pages']:
+                navigation_buttons.append(
+                    InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"channels_page:{data['page'] + 1}")
+                )
+            
+            buttons.append(navigation_buttons)
+        
         # Кнопка для проверки этих каналов
         buttons.append([
             InlineKeyboardButton(
@@ -982,8 +1032,13 @@ async def main():
             )
         ])
         
+        start_num = (data['page'] - 1) * data['per_page'] + 1
+        end_num = start_num + len(data['channels']) - 1
+        
         await message.answer(
-            f"📢 <b>Ваши каналы</b> ({len(channels)})\n\n"
+            f"📢 <b>Ваши каналы</b> ({data['total']} всего)\n"
+            f"📄 Страница {data['page']}/{data['total_pages']}\n"
+            f"📋 Показаны: {start_num}-{end_num}\n\n"
             f"Нажмите на название для перехода\n"
             f"Или удалите ненужные:",
             parse_mode="HTML",
@@ -1125,6 +1180,85 @@ async def main():
         else:
             await callback.message.edit_text(f"ℹ️ Канал @{channel} уже добавлен")
         
+        await callback.answer()
+        
+    @dp.callback_query(F.data.startswith("channels_page:"))
+    async def callback_channels_page(callback: types.CallbackQuery):
+        """Обработка переключения страниц с каналами"""
+        try:
+            page = int(callback.data.split(":")[1])
+            user_id = callback.from_user.id
+            
+            # Получаем данные для страницы
+            data = db.get_channels_paginated(user_id, page=page, per_page=8)
+            
+            # Создаем кнопки для каналов
+            buttons = []
+            for channel in data['channels']:
+                buttons.append([
+                    InlineKeyboardButton(
+                        text=f"📢 @{channel}",
+                        url=f"https://t.me/{channel}"
+                    ),
+                    InlineKeyboardButton(
+                        text="🗑️ Удалить",
+                        callback_data=f"remove_channel:{channel}"
+                    )
+                ])
+            
+            # Добавляем кнопки пагинации
+            navigation_buttons = []
+            
+            if data['total_pages'] > 1:
+                if data['page'] > 1:
+                    navigation_buttons.append(
+                        InlineKeyboardButton(text="⬅️ Назад", callback_data=f"channels_page:{data['page'] - 1}")
+                    )
+                
+                navigation_buttons.append(
+                    InlineKeyboardButton(text=f"{data['page']}/{data['total_pages']}", callback_data="noop")
+                )
+                
+                if data['page'] < data['total_pages']:
+                    navigation_buttons.append(
+                        InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"channels_page:{data['page'] + 1}")
+                    )
+                
+                buttons.append(navigation_buttons)
+            
+            # Кнопка для проверки этих каналов
+            buttons.append([
+                InlineKeyboardButton(
+                    text="🔍 Проверить эти каналы",
+                    callback_data="check_my_channels"
+                )
+            ])
+            
+            start_num = (data['page'] - 1) * data['per_page'] + 1
+            end_num = start_num + len(data['channels']) - 1
+            
+            await callback.message.edit_text(
+                f"📢 <b>Ваши каналы</b> ({data['total']} всего)\n"
+                f"📄 Страница {data['page']}/{data['total_pages']}\n"
+                f"📋 Показаны: {start_num}-{end_num}\n\n"
+                f"Нажмите на название для перехода\n"
+                f"Или удалите ненужные:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+            )
+            
+        except ValueError:
+            await callback.answer("❌ Ошибка пагинации")
+        except Exception as e:
+            logging.error(f"Ошибка переключения страниц: {e}")
+            await callback.answer("❌ Ошибка при загрузке страницы")
+        
+        await callback.answer()
+    
+    # Пустой обработчик для кнопки-заглушки
+    @dp.callback_query(F.data == "noop")
+    async def callback_noop(callback: types.CallbackQuery):
+        """Обработчик для неактивных кнопок"""
         await callback.answer()
     
     @dp.message(F.text.startswith("@"))
