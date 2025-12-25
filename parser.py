@@ -2,7 +2,7 @@ import aiohttp
 import asyncio
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple
 import backoff
 from bs4 import BeautifulSoup
@@ -154,12 +154,22 @@ class EnhancedTelegramParser:
     async def get_fresh_messages(self, channel_username: str, hours: int = 24, limit: int = 30) -> List[Dict]:
         """Получение только свежих сообщений"""
         all_messages = await self.get_channel_messages(channel_username, limit=limit)
+        # Используем offset-naive datetime для сравнения
         cutoff = datetime.now() - timedelta(hours=hours)
         
         fresh_messages = []
         for msg in all_messages:
-            if msg.get('timestamp') and msg['timestamp'] > cutoff:
-                fresh_messages.append(msg)
+            if msg.get('timestamp'):
+                # Приводим все даты к offset-naive формату для сравнения
+                msg_time = msg['timestamp']
+                if msg_time.tzinfo is not None:
+                    # Если дата с часовым поясом, конвертируем в локальное время
+                    msg_time = msg_time.astimezone(timezone.utc).replace(tzinfo=None)
+                
+                if msg_time > cutoff:
+                    # Сохраняем оригинальную дату
+                    msg['timestamp_naive'] = msg_time
+                    fresh_messages.append(msg)
         
         logger.info(f"Найдено {len(fresh_messages)} свежих сообщений в @{channel_username} (за {hours}ч)")
         return fresh_messages
@@ -197,16 +207,53 @@ class EnhancedTelegramParser:
         try:
             # Извлекаем текст с сохранением форматирования
             text_widget = widget.find('div', class_='tgme_widget_message_text')
-            if not text_widget:
-                return None
+            message_text = ""
+            if text_widget:
+                message_text = text_widget.get_text(separator='\n', strip=True)
             
-            # Получаем чистый текст
-            message_text = text_widget.get_text(separator='\n', strip=True)
-            if not message_text or len(message_text) < 30:
-                return None
+            # Проверяем наличие файлов разного типа
+            has_file = False
+            file_types = []
             
-            # Извлекаем HTML для сохранения форматирования
-            message_html = str(text_widget)
+            # Проверяем фото
+            photo_widget = widget.find('a', class_='tgme_widget_message_photo')
+            if photo_widget:
+                has_file = True
+                file_types.append('photo')
+            
+            # Проверяем видео
+            video_widget = widget.find('div', class_='tgme_widget_message_video')
+            if video_widget:
+                has_file = True
+                file_types.append('video')
+            
+            # Проверяем документы
+            document_widget = widget.find('a', class_='tgme_widget_message_document')
+            if document_widget:
+                has_file = True
+                file_types.append('document')
+            
+            # Проверяем аудио (если есть такой класс)
+            audio_widget = widget.find('div', class_='tgme_widget_message_audio')
+            if audio_widget:
+                has_file = True
+                file_types.append('audio')
+            
+            # Проверяем голосовые сообщения
+            voice_widget = widget.find('div', class_='tgme_widget_message_voice')
+            if voice_widget:
+                has_file = True
+                file_types.append('voice')
+            
+            # Проверяем стикеры
+            sticker_widget = widget.find('div', class_='tgme_widget_message_sticker')
+            if sticker_widget:
+                has_file = True
+                file_types.append('sticker')
+            
+            # Если нет текста и нет файлов, пропускаем
+            if not message_text and not has_file:
+                return None
             
             # Извлекаем время
             time_widget = widget.find('time', class_='time')
@@ -214,11 +261,23 @@ class EnhancedTelegramParser:
             if time_widget and 'datetime' in time_widget.attrs:
                 try:
                     time_str = time_widget['datetime']
+                    
                     if time_str.endswith('Z'):
                         time_str = time_str[:-1] + '+00:00'
-                    message_time = datetime.fromisoformat(time_str)
+                        message_time = datetime.fromisoformat(time_str)
+                    else:
+                        if '+' in time_str or '-' in time_str:
+                            message_time = datetime.fromisoformat(time_str)
+                        else:
+                            time_str = time_str + '+00:00'
+                            message_time = datetime.fromisoformat(time_str)
+                    
+                    if message_time.tzinfo is not None:
+                        message_time = message_time.astimezone(timezone.utc).replace(tzinfo=None)
+                        
                 except Exception as e:
                     logger.debug(f"Ошибка парсинга времени: {e}")
+                    message_time = datetime.now()
             
             # Извлекаем ID сообщения
             message_id = None
@@ -232,30 +291,25 @@ class EnhancedTelegramParser:
                     message_id = int(match.group(1))
                     message_url = href
             
-            # Определяем наличие медиа
-            has_media = bool(widget.find('a', class_='tgme_widget_message_photo') or 
-                            widget.find('div', class_='tgme_widget_message_video') or
-                            widget.find('a', class_='tgme_widget_message_document'))
-            
             # Извлекаем количество просмотров (если есть)
             views_widget = widget.find('span', class_='tgme_widget_message_views')
             views = None
             if views_widget:
                 views_text = views_widget.get_text(strip=True)
-                # Удаляем все нецифровые символы
                 views_text = re.sub(r'\D', '', views_text)
                 if views_text.isdigit():
                     views = int(views_text)
             
             return {
                 'text': message_text,
-                'html': message_html,
                 'timestamp': message_time,
                 'id': message_id,
                 'url': message_url,
                 'channel': channel,
                 'parsed_at': datetime.now(),
-                'has_media': has_media,
+                'has_file': has_file,
+                'file_types': file_types,
+                'has_media': has_file,  # Для обратной совместимости
                 'views': views,
                 'length': len(message_text)
             }

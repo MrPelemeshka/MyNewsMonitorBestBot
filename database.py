@@ -140,8 +140,40 @@ class Database:
                 logger.error(f"Ошибка добавления канала: {e}")
                 return False
     
-    def get_channels(self, user_id: int) -> list:
-        """Получает список каналов пользователя"""
+    def get_channels(self, user_id: int, page: int = 1, page_size: int = 10) -> Tuple[list, int, int]:
+        """Получает список каналов пользователя с пагинацией"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Получаем общее количество каналов
+            cursor.execute(
+                "SELECT COUNT(*) as total FROM user_channels WHERE user_id = ?",
+                (user_id,)
+            )
+            total_channels = cursor.fetchone()[0]
+            
+            # Рассчитываем offset
+            offset = (page - 1) * page_size
+            
+            # Получаем каналы для текущей страницы
+            cursor.execute(
+                """SELECT channel_username 
+                   FROM user_channels 
+                   WHERE user_id = ? 
+                   ORDER BY added_at DESC
+                   LIMIT ? OFFSET ?""",
+                (user_id, page_size, offset)
+            )
+            
+            channels = [row['channel_username'] for row in cursor.fetchall()]
+            
+            # Рассчитываем общее количество страниц
+            total_pages = (total_channels + page_size - 1) // page_size
+            
+            return channels, total_channels, total_pages
+    
+    def get_all_channels(self, user_id: int) -> list:
+        """Получает все каналы пользователя (без пагинации)"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -216,7 +248,6 @@ class Database:
         if message_id:
             content = f"{channel}:{message_id}".encode('utf-8')
         else:
-            # Используем первые 500 символов для уникальности
             content = f"{channel}:{text[:500]}".encode('utf-8')
         return hashlib.md5(content).hexdigest()
     
@@ -241,13 +272,6 @@ class Database:
                 (news_hash, user_id, channel, message_id)
             )
             
-            # Очищаем старые записи (старше 30 дней)
-            month_ago = datetime.now() - timedelta(days=30)
-            cursor.execute(
-                "DELETE FROM sent_news WHERE sent_at < ?",
-                (month_ago,)
-            )
-            
             conn.commit()
     
     def cleanup_old_news(self, days: int = 30):
@@ -263,25 +287,6 @@ class Database:
             conn.commit()
             logger.info(f"Очищено {deleted_count} старых записей новостей")
             return deleted_count
-    
-    def get_user_activity_stats(self, user_id: int, days: int = 30) -> List[Dict]:
-        """Получение статистики активности пользователя по дням"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                SELECT 
-                    DATE(sent_at) as date,
-                    COUNT(*) as news_count,
-                    COUNT(DISTINCT channel_username) as channels_count
-                FROM sent_news 
-                WHERE user_id = ? 
-                    AND sent_at > DATE('now', ?)
-                GROUP BY DATE(sent_at)
-                ORDER BY date DESC
-            ''', (user_id, f'-{days} days'))
-            
-            return [dict(row) for row in cursor.fetchall()]
 
 # Глобальный объект БД
 db = Database()
