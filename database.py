@@ -1,277 +1,287 @@
 import sqlite3
-import json
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
+import logging
+
+logger = logging.getLogger(__name__)
 
 class Database:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str = 'news_bot.db'):
         self.db_path = db_path
         self.init_database()
     
+    def get_connection(self) -> sqlite3.Connection:
+        """Получение соединения с базой"""
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+    
     def init_database(self):
-        """Инициализация всех таблиц"""
-        with sqlite3.connect(self.db_path) as conn:
+        """Создание таблиц с индексами для ускорения запросов"""
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             
             # Пользователи
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    is_active INTEGER DEFAULT 1
+                    username TEXT,
+                    first_name TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             
-            # Ключевые слова пользователей
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS user_keywords (
-                    user_id INTEGER,
-                    keyword TEXT,
-                    is_negative INTEGER DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (user_id, keyword, is_negative),
-                    FOREIGN KEY (user_id) REFERENCES users(user_id)
-                )
-            ''')
-            
-            # Каналы пользователей
+            # Каналы
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS user_channels (
                     user_id INTEGER,
                     channel_username TEXT,
                     added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (user_id, channel_username),
-                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                    PRIMARY KEY (user_id, channel_username)
                 )
             ''')
             
-            # Отправленные новости (для дубликатов)
+            # Ключевые слова
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS user_keywords (
+                    user_id INTEGER,
+                    keyword TEXT,
+                    is_negative INTEGER DEFAULT 0,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, keyword, is_negative)
+                )
+            ''')
+            
+            # Отправленные новости
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS sent_news (
-                    news_hash TEXT PRIMARY KEY,
+                    news_hash TEXT,
                     user_id INTEGER,
                     channel_username TEXT,
                     message_id INTEGER,
                     sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                    PRIMARY KEY (news_hash, user_id)
                 )
             ''')
             
-            # Статистика
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS stats (
-                    user_id INTEGER,
-                    date DATE,
-                    news_sent INTEGER DEFAULT 0,
-                    PRIMARY KEY (user_id, date),
-                    FOREIGN KEY (user_id) REFERENCES users(user_id)
-                )
-            ''')
+            # Создаем индексы для ускорения поиска
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sent_news_user ON sent_news(user_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sent_news_hash ON sent_news(news_hash)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_channels_user ON user_channels(user_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_keywords_user ON user_keywords(user_id)")
             
             conn.commit()
     
     # === Методы для пользователей ===
-    
-    def add_user(self, user_id: int):
-        """Добавление нового пользователя"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            try:
-                cursor.execute(
-                    "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
-                    (user_id,)
-                )
-                
-                # Добавляем ключевые слова по умолчанию
-                from config import Config
-                for keyword in Config.DEFAULT_KEYWORDS:
-                    cursor.execute(
-                        "INSERT OR IGNORE INTO user_keywords (user_id, keyword) VALUES (?, ?)",
-                        (user_id, keyword)
-                    )
-                
-                for keyword in Config.DEFAULT_NEGATIVE:
-                    cursor.execute(
-                        "INSERT OR IGNORE INTO user_keywords (user_id, keyword, is_negative) VALUES (?, ?, 1)",
-                        (user_id, keyword)
-                    )
-                
-                conn.commit()
-            except Exception as e:
-                print(f"Ошибка добавления пользователя: {e}")
-    
-    def get_user_channels(self, user_id: int) -> List[str]:
-        """Получение каналов пользователя"""
-        with sqlite3.connect(self.db_path) as conn:
+    def add_user(self, user_id: int, username: str = None, first_name: str = None):
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT channel_username FROM user_channels WHERE user_id = ? ORDER BY added_at",
+                '''INSERT OR IGNORE INTO users (user_id, username, first_name) 
+                   VALUES (?, ?, ?)''',
+                (user_id, username, first_name)
+            )
+            conn.commit()
+    
+    def get_user_stats(self, user_id: int) -> Dict[str, any]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute(
+                "SELECT COUNT(*) FROM user_channels WHERE user_id = ?",
                 (user_id,)
             )
-            return [row[0] for row in cursor.fetchall()]
+            channels_count = cursor.fetchone()[0]
+            
+            cursor.execute(
+                "SELECT COUNT(*) FROM user_keywords WHERE user_id = ? AND is_negative = 0",
+                (user_id,)
+            )
+            keywords_count = cursor.fetchone()[0]
+            
+            cursor.execute(
+                "SELECT COUNT(*) FROM user_keywords WHERE user_id = ? AND is_negative = 1",
+                (user_id,)
+            )
+            negative_count = cursor.fetchone()[0]
+            
+            cursor.execute(
+                "SELECT COUNT(*) FROM sent_news WHERE user_id = ?",
+                (user_id,)
+            )
+            sent_count = cursor.fetchone()[0]
+            
+            return {
+                'channels': channels_count,
+                'keywords': keywords_count,
+                'negative_keywords': negative_count,
+                'sent_news': sent_count
+            }
     
-    def add_user_channel(self, user_id: int, channel_username: str) -> bool:
-        """Добавление канала пользователю"""
-        channel_username = channel_username.lstrip('@')
-        with sqlite3.connect(self.db_path) as conn:
+    # === Методы для каналов ===
+    def add_channel(self, user_id: int, channel: str) -> bool:
+        """Добавляет канал для пользователя"""
+        channel = channel.lstrip('@').lower()
+        if not channel:
+            return False
+            
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             try:
                 cursor.execute(
-                    "INSERT OR IGNORE INTO user_channels (user_id, channel_username) VALUES (?, ?)",
-                    (user_id, channel_username)
+                    '''INSERT OR IGNORE INTO user_channels 
+                       (user_id, channel_username) VALUES (?, ?)''',
+                    (user_id, channel)
                 )
                 conn.commit()
                 return cursor.rowcount > 0
-            except:
+            except Exception as e:
+                logger.error(f"Ошибка добавления канала: {e}")
                 return False
     
-    def remove_user_channel(self, user_id: int, channel_username: str) -> bool:
-        """Удаление канала у пользователя"""
-        channel_username = channel_username.lstrip('@')
-        with sqlite3.connect(self.db_path) as conn:
+    def get_channels(self, user_id: int) -> list:
+        """Получает список каналов пользователя"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT channel_username 
+                   FROM user_channels 
+                   WHERE user_id = ? 
+                   ORDER BY added_at""",
+                (user_id,)
+            )
+            return [row['channel_username'] for row in cursor.fetchall()]
+    
+    def remove_channel(self, user_id: int, channel: str) -> bool:
+        """Удаляет канал"""
+        channel = channel.lstrip('@').lower()
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "DELETE FROM user_channels WHERE user_id = ? AND channel_username = ?",
-                (user_id, channel_username)
+                (user_id, channel)
             )
             conn.commit()
             return cursor.rowcount > 0
     
     # === Методы для ключевых слов ===
-    
-    def update_user_keywords(self, user_id: int, keywords: List[str], is_negative: bool = False):
-        """Обновление ключевых слов пользователя"""
-        with sqlite3.connect(self.db_path) as conn:
+    def set_keywords(self, user_id: int, keywords: list, is_negative: bool = False):
+        """Устанавливает ключевые слова для пользователя"""
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             
-            # Удаляем старые ключевые слова этого типа
+            # Удаляем старые ключевые слова
             cursor.execute(
                 "DELETE FROM user_keywords WHERE user_id = ? AND is_negative = ?",
                 (user_id, 1 if is_negative else 0)
             )
             
             # Добавляем новые
+            unique_keywords = set()
             for keyword in keywords:
-                cursor.execute(
-                    "INSERT INTO user_keywords (user_id, keyword, is_negative) VALUES (?, ?, ?)",
-                    (user_id, keyword.strip(), 1 if is_negative else 0)
-                )
+                keyword = keyword.strip().lower()
+                if keyword and keyword not in unique_keywords:
+                    unique_keywords.add(keyword)
+                    cursor.execute(
+                        '''INSERT INTO user_keywords (user_id, keyword, is_negative) 
+                           VALUES (?, ?, ?)''',
+                        (user_id, keyword, 1 if is_negative else 0)
+                    )
             
             conn.commit()
     
-    def get_user_keywords(self, user_id: int) -> Tuple[List[str], List[str]]:
-        """Получение ключевых слов пользователя"""
-        with sqlite3.connect(self.db_path) as conn:
+    def get_keywords(self, user_id: int) -> Tuple[list, list]:
+        """Получает ключевые слова пользователя"""
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             
-            # Положительные ключевые слова
             cursor.execute(
                 "SELECT keyword FROM user_keywords WHERE user_id = ? AND is_negative = 0",
                 (user_id,)
             )
-            keywords = [row[0] for row in cursor.fetchall()]
+            keywords = [row['keyword'] for row in cursor.fetchall()]
             
-            # Отрицательные ключевые слова
             cursor.execute(
                 "SELECT keyword FROM user_keywords WHERE user_id = ? AND is_negative = 1",
                 (user_id,)
             )
-            negative_keywords = [row[0] for row in cursor.fetchall()]
+            negative_keywords = [row['keyword'] for row in cursor.fetchall()]
             
             return keywords, negative_keywords
     
-    # === Методы для новостей и дубликатов ===
-    
-    def generate_news_hash(self, text: str, channel: str) -> str:
-        """Генерация уникального хеша новости"""
-        content = f"{channel}:{text[:200]}"
-        return hashlib.md5(content.encode()).hexdigest()
+    # === Методы для новостей ===
+    def generate_news_hash(self, text: str, channel: str, message_id: int = None) -> str:
+        """Генерирует уникальный хэш для новости"""
+        if message_id:
+            content = f"{channel}:{message_id}".encode('utf-8')
+        else:
+            # Используем первые 500 символов для уникальности
+            content = f"{channel}:{text[:500]}".encode('utf-8')
+        return hashlib.md5(content).hexdigest()
     
     def is_news_sent(self, user_id: int, news_hash: str) -> bool:
-        """Проверка, отправлялась ли новость пользователю"""
-        with sqlite3.connect(self.db_path) as conn:
+        """Проверяет, была ли уже отправлена эта новость"""
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT 1 FROM sent_news WHERE user_id = ? AND news_hash = ?",
+                "SELECT 1 FROM sent_news WHERE user_id = ? AND news_hash = ? LIMIT 1",
                 (user_id, news_hash)
             )
             return cursor.fetchone() is not None
     
-    def mark_news_sent(self, user_id: int, news_hash: str, channel_username: str, message_id: int):
-        """Отметка новости как отправленной"""
-        with sqlite3.connect(self.db_path) as conn:
+    def mark_news_sent(self, user_id: int, news_hash: str, channel: str, message_id: int = None):
+        """Отмечает новость как отправленную"""
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                '''INSERT OR REPLACE INTO sent_news 
+                '''INSERT OR IGNORE INTO sent_news 
                    (news_hash, user_id, channel_username, message_id) 
                    VALUES (?, ?, ?, ?)''',
-                (news_hash, user_id, channel_username, message_id)
+                (news_hash, user_id, channel, message_id)
             )
             
-            # Обновляем статистику
-            today = datetime.now().date()
-            cursor.execute('''
-                INSERT INTO stats (user_id, date, news_sent)
-                VALUES (?, ?, 1)
-                ON CONFLICT(user_id, date) DO UPDATE SET
-                news_sent = news_sent + 1
-            ''', (user_id, today))
+            # Очищаем старые записи (старше 30 дней)
+            month_ago = datetime.now() - timedelta(days=30)
+            cursor.execute(
+                "DELETE FROM sent_news WHERE sent_at < ?",
+                (month_ago,)
+            )
             
             conn.commit()
     
-    # === Методы для статистики ===
+    def cleanup_old_news(self, days: int = 30):
+        """Очищает старые записи о новостях"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cutoff_date = datetime.now() - timedelta(days=days)
+            cursor.execute(
+                "DELETE FROM sent_news WHERE sent_at < ?",
+                (cutoff_date,)
+            )
+            deleted_count = cursor.rowcount
+            conn.commit()
+            logger.info(f"Очищено {deleted_count} старых записей новостей")
+            return deleted_count
     
-    def get_user_stats(self, user_id: int) -> Dict:
-        """Получение статистики пользователя"""
-        with sqlite3.connect(self.db_path) as conn:
+    def get_user_activity_stats(self, user_id: int, days: int = 30) -> List[Dict]:
+        """Получение статистики активности пользователя по дням"""
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             
-            # Общая статистика
             cursor.execute('''
-                SELECT SUM(news_sent) FROM stats WHERE user_id = ?
-            ''', (user_id,))
-            total_news = cursor.fetchone()[0] or 0
-            
-            # Статистика за последние 7 дней
-            cursor.execute('''
-                SELECT date, news_sent FROM stats 
-                WHERE user_id = ? AND date >= date('now', '-7 days')
+                SELECT 
+                    DATE(sent_at) as date,
+                    COUNT(*) as news_count,
+                    COUNT(DISTINCT channel_username) as channels_count
+                FROM sent_news 
+                WHERE user_id = ? 
+                    AND sent_at > DATE('now', ?)
+                GROUP BY DATE(sent_at)
                 ORDER BY date DESC
-            ''', (user_id,))
-            last_week = cursor.fetchall()
+            ''', (user_id, f'-{days} days'))
             
-            return {
-                'total_news': total_news,
-                'last_week': dict(last_week) if last_week else {},
-                'channels_count': len(self.get_user_channels(user_id))
-            }
-    
-    # === Административные методы ===
-    
-    def get_all_users(self) -> List[int]:
-        """Получение всех пользователей"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT user_id FROM users WHERE is_active = 1")
-            return [row[0] for row in cursor.fetchall()]
-    
-    def get_bot_stats(self) -> Dict:
-        """Получение общей статистики бота"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute("SELECT COUNT(*) FROM users WHERE is_active = 1")
-            total_users = cursor.fetchone()[0]
-            
-            cursor.execute("SELECT SUM(news_sent) FROM stats")
-            total_news = cursor.fetchone()[0] or 0
-            
-            cursor.execute("SELECT COUNT(DISTINCT channel_username) FROM user_channels")
-            total_channels = cursor.fetchone()[0] or 0
-            
-            return {
-                'total_users': total_users,
-                'total_news': total_news,
-                'total_channels': total_channels
-            }
+            return [dict(row) for row in cursor.fetchall()]
+
+# Глобальный объект БД
+db = Database()

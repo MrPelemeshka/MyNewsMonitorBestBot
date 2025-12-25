@@ -1,1381 +1,1342 @@
 import asyncio
 import logging
-import aiohttp
-import sqlite3
-import hashlib
 import re
+import html
+import random
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
-from bs4 import BeautifulSoup
+from typing import List, Dict, Optional, Tuple
+from collections import defaultdict
 
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.types import (
+    Message, InlineKeyboardMarkup, InlineKeyboardButton, 
+    ReplyKeyboardMarkup, KeyboardButton, CallbackQuery,
+    ReplyKeyboardRemove
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.enums import ParseMode
 
-# === ВАШИ ДАННЫЕ ===
-BOT_TOKEN = "8377696397:AAFi8gsJlXIZsjgxzC4SoCnwqqtVzUk3oms"
-ADMIN_ID = 7261954639
-# ===================
+from config import config
+from database import db
+from parser import parser
 
-# Настройки прокси для PythonAnywhere
-PROXY_AUTH = aiohttp.BasicAuth('proxyuser', 'proxyuser')
-PROXY_URL = "http://proxy.server:3128"
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Создаем роутер
+router = Router()
 
 # Состояния для FSM
 class UserStates(StatesGroup):
     waiting_for_keywords = State()
     waiting_for_negative = State()
-    waiting_for_custom_period = State()
+    waiting_for_channel = State()
+    waiting_for_weighted_keywords = State()
+    waiting_for_category = State()
 
-# ==================== ТЕЛЕГРАМ WEB ПАРСЕР ====================
+# Вспомогательные функции
+def escape_html(text: str) -> str:
+    """Экранирование HTML символов с фильтрацией неподдерживаемых тегов"""
+    # Сначала экранируем все
+    text = html.escape(text)
+    
+    # Удаляем неподдерживаемые теги
+    unsupported_tags = ['<small>', '</small>', '<big>', '</big>', '<center>', '</center>']
+    for tag in unsupported_tags:
+        text = text.replace(tag, '')
+    
+    return text
 
-class TelegramWebParser:
-    """Парсер публичных Telegram каналов через веб-интерфейс"""
+# Класс для форматирования новостей
+class NewsFormatter:
+    """Улучшенный форматировщик новостей"""
     
-    def __init__(self):
-        self.base_url = "https://t.me/s/"
-        self.session = None
+    @staticmethod
+    def _extract_title(text: str, max_length: int = 100) -> str:
+        """Извлечение заголовка из текста"""
+        # Берем первую строку или первые N символов
+        lines = text.strip().split('\n')
+        first_line = lines[0].strip()
         
-    async def init_session(self):
-        """Инициализация aiohttp сессии"""
-        if not self.session:
-            connector = aiohttp.TCPConnector(ssl=False)
-            timeout = aiohttp.ClientTimeout(total=30)
-            self.session = aiohttp.ClientSession(
-                connector=connector,
-                timeout=timeout,
-                headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
-            )
+        if len(first_line) > 10 and len(first_line) < max_length:
+            return first_line
+        
+        # Или обрезаем начало текста
+        return text[:max_length].strip() + ('...' if len(text) > max_length else '')
     
-    async def close_session(self):
-        """Закрытие сессии"""
-        if self.session:
-            await self.session.close()
-            self.session = None
+    @staticmethod
+    def _create_excerpt(text: str, max_length: int = 300) -> str:
+        """Создание краткого описания"""
+        text = re.sub(r'\s+', ' ', text.strip())
+        
+        if len(text) <= max_length:
+            return text
+        
+        # Обрезаем до последнего полного предложения или слова
+        if '.' in text[:max_length]:
+            cut_point = text[:max_length].rfind('.') + 1
+        elif ' ' in text[:max_length]:
+            cut_point = text[:max_length].rfind(' ') + 1
+        else:
+            cut_point = max_length
+        
+        return text[:cut_point].strip() + '...'
     
-    async def get_channel_messages(self, channel_username: str, limit: int = 50) -> List[Dict]:
-        """
-        Получение сообщений из публичного Telegram канала
-        
-        Args:
-            channel_username: username канала (без @)
-            limit: максимальное количество сообщений для парсинга
-        """
-        await self.init_session()
-        
-        channel = channel_username.lstrip('@')
-        url = f"{self.base_url}{channel}"
-        
-        try:
-            # Используем прокси PythonAnywhere
-            proxy_auth = aiohttp.BasicAuth('proxyuser', 'proxyuser')
-            
-            async with self.session.get(
-                url, 
-                proxy=PROXY_URL,
-                proxy_auth=proxy_auth,
-                timeout=30
-            ) as response:
-                if response.status != 200:
-                    logging.error(f"Ошибка {response.status} для {url}")
-                    return []
-                
-                html_content = await response.text()
-                
-                # Парсим HTML
-                soup = BeautifulSoup(html_content, 'html.parser')
-                
-                # Находим все сообщения
-                messages = []
-                message_widgets = soup.find_all('div', class_='tgme_widget_message')
-                
-                for widget in message_widgets[:limit]:
-                    message_data = self._parse_message_widget(widget, channel)
-                    if message_data:
-                        messages.append(message_data)
-                
-                # Сортируем по времени (новые сверху)
-                messages.sort(key=lambda x: x['timestamp'] if x['timestamp'] else datetime.min, reverse=True)
-                
-                return messages
-                
-        except Exception as e:
-            logging.error(f"Ошибка парсинга канала {channel}: {e}")
-            return []
+    @staticmethod
+    def _determine_category(keywords: List[str]) -> str:
+        """Определение категории по ключевым словам"""
+        for category, terms in config.CATEGORIES.items():
+            for keyword in keywords:
+                keyword_lower = keyword.lower()
+                for term in terms:
+                    if term in keyword_lower or keyword_lower in term:
+                        return category
+        return 'other'
     
-    def _parse_message_widget(self, widget, channel: str) -> Optional[Dict]:
-        """Парсинг отдельного виджета сообщения"""
-        try:
-            # Извлекаем текст сообщения
-            text_widget = widget.find('div', class_='tgme_widget_message_text')
-            if not text_widget:
-                return None
-            
-            # Получаем чистый текст
-            message_text = text_widget.get_text(separator='\n', strip=True)
-            if not message_text or len(message_text) < 30:  # Слишком короткие пропускаем
-                return None
-            
-            # Извлекаем время сообщения
-            time_widget = widget.find('time', class_='time')
-            message_time = None
-            if time_widget and 'datetime' in time_widget.attrs:
-                try:
-                    time_str = time_widget['datetime']
-                    # Убираем 'Z' и добавляем временную зону UTC
-                    time_str = time_str.replace('Z', '+00:00')
-                    message_time = datetime.fromisoformat(time_str)
-                    # Конвертируем в локальное время
-                    message_time = message_time.astimezone()
-                except Exception as e:
-                    logging.debug(f"Ошибка парсинга времени: {e}")
-                    message_time = None
-            
-            # Извлекаем ID сообщения
-            message_id = None
-            link_widget = widget.find('a', class_='tgme_widget_message_date')
-            if link_widget and 'href' in link_widget.attrs:
-                href = link_widget['href']
-                match = re.search(r'/(\d+)$', href)
-                if match:
-                    message_id = int(match.group(1))
-            
-            # Формируем URL сообщения
-            message_url = None
-            if message_id:
-                message_url = f"https://t.me/{channel}/{message_id}"
-            
-            return {
-                'text': message_text,
-                'timestamp': message_time,
-                'id': message_id,
-                'url': message_url,
-                'channel': channel,
-                'parsed_at': datetime.now()
-            }
-            
-        except Exception as e:
-            logging.error(f"Ошибка парсинга виджета: {e}")
-            return None
-    
-    def filter_messages_by_time(self, messages: List[Dict], hours: int = 24) -> List[Dict]:
-        """Фильтрация сообщений по времени"""
-        if hours <= 0:  # 0 = все сообщения
-            return messages
+    @staticmethod
+    def format_news_card(msg: Dict, analysis: Dict, category: str = None) -> str:
+        """Форматирование новости в виде карточки"""
+        if not category:
+            found_keywords = analysis.get('found_keywords', [])
+            keywords = [k['keyword'] for k in found_keywords] if isinstance(found_keywords, list) else []
+            category = NewsFormatter._determine_category(keywords)
         
-        cutoff_time = datetime.now() - timedelta(hours=hours)
-        # Убедимся, что cutoff_time имеет тот же часовой пояс
-        if cutoff_time.tzinfo is None:
-            cutoff_time = cutoff_time.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        icon = config.CATEGORY_ICONS.get(category, '📰')
+        title = NewsFormatter._extract_title(msg['text'])
+        excerpt = NewsFormatter._create_excerpt(msg['text'], 250)
+        channel = msg.get('channel', 'unknown')
         
-        filtered = []
-        
-        for msg in messages:
-            msg_time = msg.get('timestamp')
+        # Форматируем время
+        time_str = ""
+        if msg.get('timestamp'):
+            now = datetime.now()
+            msg_time = msg['timestamp']
             
-            # Если время не определено, включаем сообщение
-            if not msg_time:
-                filtered.append(msg)
-                continue
-            
-            # Убедимся, что оба времени имеют часовой пояс
-            if msg_time.tzinfo is None:
-                # Если у сообщения нет часового пояса, считаем его локальным
-                msg_time = msg_time.replace(tzinfo=datetime.now().astimezone().tzinfo)
-            
-            if msg_time >= cutoff_time:
-                filtered.append(msg)
+            if now.date() == msg_time.date():
+                time_str = f"Сегодня в {msg_time.strftime('%H:%M')}"
+            elif (now - timedelta(days=1)).date() == msg_time.date():
+                time_str = f"Вчера в {msg_time.strftime('%H:%M')}"
+            else:
+                time_str = msg_time.strftime("%d.%m.%Y в %H:%M")
         
-        return filtered
-
-# ==================== БАЗА ДАННЫХ ====================
-
-class NewsBotDB:
-    """База данных для бота"""
-    
-    def __init__(self, db_path: str = 'news_bot_web.db'):
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.init_db()
-    
-    def init_db(self):
-        cursor = self.conn.cursor()
+        # Собираем HTML сообщение
+        parts = []
         
-        # Пользователи
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_check TIMESTAMP
-            )
-        ''')
+        # Заголовок с иконкой категории
+        parts.append(f"{icon} <b>{escape_html(title)}</b>\n")
         
-        # Каналы пользователя
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_channels (
-                user_id INTEGER,
-                channel_username TEXT,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                is_active INTEGER DEFAULT 1,
-                PRIMARY KEY (user_id, channel_username)
-            )
-        ''')
+        # Источник и время
+        parts.append(f"📢 @{channel}  ⏰ {time_str}\n")
+        
+        # Рейтинг релевантности (если есть)
+        if 'score' in analysis:
+            score = analysis['score']
+            if score > 3:
+                stars = min(int(score / 2), 5)  # Максимум 5 звезд
+                parts.append("⭐" * stars + "\n")
+        
+        # Основной текст
+        parts.append(f"\n{escape_html(excerpt)}\n")
         
         # Ключевые слова
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_keywords (
-                user_id INTEGER,
-                keyword TEXT,
-                is_negative INTEGER DEFAULT 0,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (user_id, keyword, is_negative)
-            )
-        ''')
+        found_keywords = analysis.get('found_keywords', [])
+        if found_keywords and isinstance(found_keywords, list):
+            keywords = [k['keyword'] for k in found_keywords[:3]]
+            keywords_text = ", ".join(keywords)
+            parts.append(f"\n🏷️ <i>{escape_html(keywords_text)}</i>\n")
         
-        # Отправленные новости
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS sent_news (
-                news_hash TEXT,
-                user_id INTEGER,
-                channel_username TEXT,
-                message_id INTEGER,
-                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (news_hash, user_id)
-            )
-        ''')
+        # Дополнительная информация
+        if msg.get('has_media'):
+            parts.append("📎 <i>Есть вложения</i>\n")
         
-        # История проверок
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS check_history (
-                user_id INTEGER,
-                check_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                period_hours INTEGER,
-                channels_checked INTEGER,
-                news_found INTEGER,
-                success INTEGER DEFAULT 1
-            )
-        ''')
+        if msg.get('views'):
+            parts.append(f"👁️ <i>{msg['views']} просмотров</i>\n")
         
-        self.conn.commit()
+        # Ссылка
+        if msg.get('url'):
+            parts.append(f"\n🔗 <a href='{escape_html(msg['url'])}'>Читать полностью в канале</a>")
+        
+        return "".join(parts)
+
+# Класс для анализа релевантности
+class RelevanceAnalyzer:
+    """Анализатор релевантности с весовыми коэффициентами"""
     
-    # === Методы для пользователей ===
-    def add_user(self, user_id: int, username: str = None, first_name: str = None):
-        cursor = self.conn.cursor()
-        cursor.execute(
-            '''INSERT OR IGNORE INTO users (user_id, username, first_name) 
-               VALUES (?, ?, ?)''',
-            (user_id, username, first_name)
-        )
-        self.conn.commit()
-    
-    def update_last_check(self, user_id: int):
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "UPDATE users SET last_check = CURRENT_TIMESTAMP WHERE user_id = ?",
-            (user_id,)
-        )
-        self.conn.commit()
-    
-    def get_channels_paginated(self, user_id: int, page: int = 1, per_page: int = 8):
-        #Получение каналов с пагинацией
-        cursor = self.conn.cursor()
-        offset = (page - 1) * per_page
+    @staticmethod
+    def parse_weighted_keywords(keywords_input: str) -> List[Tuple[str, float]]:
+        """Парсинг ключевых слов с весами"""
+        weighted_keywords = []
         
-        # Получаем каналы для страницы
-        cursor.execute(
-            "SELECT channel_username FROM user_channels WHERE user_id = ? AND is_active = 1 ORDER BY added_at LIMIT ? OFFSET ?",
-            (user_id, per_page, offset)
-        )
-        channels = [row[0] for row in cursor.fetchall()]
+        for item in keywords_input.split(','):
+            item = item.strip()
+            if not item:
+                continue
+                
+            if ':' in item:
+                parts = item.split(':')
+                if len(parts) == 2:
+                    keyword = parts[0].strip()
+                    try:
+                        weight = float(parts[1].strip())
+                        weighted_keywords.append((keyword, max(0.1, min(weight, 5.0))))
+                    except ValueError:
+                        weighted_keywords.append((keyword, 1.0))
+            else:
+                weighted_keywords.append((item, 1.0))
         
-        # Получаем общее количество
-        cursor.execute(
-            "SELECT COUNT(*) FROM user_channels WHERE user_id = ? AND is_active = 1",
-            (user_id,)
-        )
-        total = cursor.fetchone()[0]
+        return weighted_keywords
+    
+    @staticmethod
+    def analyze_message(text: str, weighted_keywords: List[Tuple[str, float]], 
+                       negative_keywords: List[str]) -> Dict:
+        """Анализ сообщения с учетом весов"""
+        text_lower = f" {text.lower()} "
+        
+        # Поиск ключевых слов с весами
+        found_keywords = []
+        total_score = 0
+        
+        for keyword, weight in weighted_keywords:
+            keyword_lower = keyword.lower()
+            
+            # Разные стратегии поиска с разными коэффициентами
+            score = 0
+            
+            # Точное совпадение слова (лучший результат)
+            if f" {keyword_lower} " in text_lower:
+                score = weight * 2.0
+            
+            # Часть слова или с другими символами
+            elif keyword_lower in text_lower:
+                # Проверяем, чтобы это было отдельное слово
+                pattern = r'[^a-zA-Zа-яА-Я0-9]' + re.escape(keyword_lower) + r'[^a-zA-Zа-яА-Я0-9]'
+                if re.search(pattern, text_lower):
+                    score = weight * 1.5
+                else:
+                    score = weight * 1.0
+            
+            if score > 0:
+                found_keywords.append({
+                    'keyword': keyword,
+                    'weight': weight,
+                    'score': score
+                })
+                total_score += score
+        
+        # Проверка отрицательных ключевых слов
+        negative_score = 0
+        found_negative = []
+        
+        for neg_keyword in negative_keywords:
+            neg_lower = neg_keyword.lower()
+            if f" {neg_lower} " in text_lower:
+                negative_score += 3.0
+                found_negative.append(neg_keyword)
+            elif neg_lower in text_lower:
+                negative_score += 1.5
+                found_negative.append(neg_keyword)
+        
+        # Итоговый скор с учетом отрицательных слов
+        final_score = max(0, total_score - negative_score)
         
         return {
-            'channels': channels,
-            'total': total,
-            'page': page,
-            'per_page': per_page,
-            'total_pages': (total + per_page - 1) // per_page
+            'relevant': final_score > 0.5,
+            'score': final_score,
+            'total_score': total_score,
+            'negative_score': negative_score,
+            'found_keywords': found_keywords,
+            'found_negative': found_negative,
+            'keyword_count': len(found_keywords),
+            'has_negative': negative_score > 0
         }
+
+# Класс для управления очередью отправки
+class NewsQueueManager:
+    """Менеджер очереди отправки новостей"""
     
-    # === Методы для каналов ===
-    def add_channel(self, user_id: int, channel: str) -> bool:
-        cursor = self.conn.cursor()
-        channel = channel.lstrip('@')
-        try:
-            cursor.execute(
-                '''INSERT OR IGNORE INTO user_channels 
-                   (user_id, channel_username, is_active) VALUES (?, ?, 1)''',
-                (user_id, channel)
-            )
-            self.conn.commit()
-            return cursor.rowcount > 0
-        except:
-            return False
+    def __init__(self, bot: Bot = None):
+        self.queue = asyncio.Queue()
+        self.processing = False
+        self.stats = {
+            'sent': 0,
+            'failed': 0,
+            'skipped': 0,
+            'queue_size': 0
+        }
+        self.bot = bot
     
-    def get_channels(self, user_id: int, active_only: bool = True) -> list:
-        cursor = self.conn.cursor()
-        if active_only:
-            cursor.execute(
-                "SELECT channel_username FROM user_channels WHERE user_id = ? AND is_active = 1 ORDER BY added_at",
-                (user_id,)
-            )
-        else:
-            cursor.execute(
-                "SELECT channel_username FROM user_channels WHERE user_id = ? ORDER BY added_at",
-                (user_id,)
-            )
-        return [row[0] for row in cursor.fetchall()]
+    def set_bot(self, bot: Bot):
+        """Установить бота"""
+        self.bot = bot
     
-    def remove_channel(self, user_id: int, channel: str) -> bool:
-        cursor = self.conn.cursor()
-        channel = channel.lstrip('@')
-        cursor.execute(
-            "DELETE FROM user_channels WHERE user_id = ? AND channel_username = ?",
-            (user_id, channel)
-        )
-        self.conn.commit()
-        return cursor.rowcount > 0
-    
-    def deactivate_channel(self, user_id: int, channel: str):
-        """Деактивация канала вместо удаления"""
-        cursor = self.conn.cursor()
-        channel = channel.lstrip('@')
-        cursor.execute(
-            "UPDATE user_channels SET is_active = 0 WHERE user_id = ? AND channel_username = ?",
-            (user_id, channel)
-        )
-        self.conn.commit()
-    
-    # === Методы для ключевых слов ===
-    def set_keywords(self, user_id: int, keywords: list, is_negative: bool = False):
-        cursor = self.conn.cursor()
+    async def add_news_batch(self, user_id: int, news_items: List[Dict]):
+        """Добавление партии новостей в очередь с сортировкой"""
+        if not news_items:
+            return
         
-        # Удаляем старые ключевые слова этого типа
-        cursor.execute(
-            "DELETE FROM user_keywords WHERE user_id = ? AND is_negative = ?",
-            (user_id, 1 if is_negative else 0)
-        )
+        # Сортируем по релевантности (самые релевантные сначала)
+        sorted_items = sorted(news_items, 
+                            key=lambda x: x.get('analysis', {}).get('score', 0), 
+                            reverse=True)
         
-        # Добавляем новые
-        for keyword in keywords:
-            keyword = keyword.strip().lower()
-            if keyword:
-                cursor.execute(
-                    '''INSERT INTO user_keywords (user_id, keyword, is_negative) 
-                       VALUES (?, ?, ?)''',
-                    (user_id, keyword, 1 if is_negative else 0)
+        for item in sorted_items:
+            await self.queue.put({
+                'user_id': user_id,
+                'news_item': item,
+                'added_at': datetime.now()
+            })
+        
+        self.stats['queue_size'] = self.queue.qsize()
+    
+    async def process_queue(self, batch_size: int = 5, delay: float = 1.0):
+        """Обработка очереди с ограничением скорости"""
+        self.processing = True
+        
+        while self.processing:
+            batch = []
+            try:
+                # Собираем батч
+                for _ in range(min(batch_size, self.queue.qsize())):
+                    if not self.queue.empty():
+                        item = await self.queue.get()
+                        batch.append(item)
+                    else:
+                        break
+                
+                if batch and self.bot:
+                    # Отправляем батч
+                    sent_count = await self._send_batch(batch)
+                    self.stats['sent'] += sent_count
+                    self.stats['queue_size'] = self.queue.qsize()
+                    
+                    # Пауза между батчами
+                    if sent_count > 0:
+                        await asyncio.sleep(delay)
+                else:
+                    # Очередь пуста, ждем
+                    await asyncio.sleep(5)
+                    
+            except Exception as e:
+                logger.error(f"Ошибка обработки очереди: {e}")
+                self.stats['failed'] += len(batch)
+                await asyncio.sleep(10)
+    
+    async def _send_batch(self, batch: List[Dict]) -> int:
+        """Отправка батча новостей"""
+        sent_count = 0
+        
+        for item in batch:
+            try:
+                user_id = item['user_id']
+                news_item = item['news_item']
+                
+                # Форматируем сообщение
+                found_keywords = news_item['analysis'].get('found_keywords', [])
+                keywords = [k['keyword'] for k in found_keywords] if isinstance(found_keywords, list) else []
+                category = NewsFormatter._determine_category(keywords)
+                
+                message_text = NewsFormatter.format_news_card(
+                    news_item['message'],
+                    news_item['analysis'],
+                    category
                 )
+                
+                # Отправляем сообщение
+                await self.bot.send_message(
+                    chat_id=user_id,
+                    text=message_text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=False
+                )
+                
+                # Отмечаем как отправленное
+                db.mark_news_sent(
+                    user_id, 
+                    news_item['hash'], 
+                    news_item['message']['channel'],
+                    news_item['message'].get('id')
+                )
+                
+                sent_count += 1
+                
+                # Небольшая пауза между сообщениями в батче
+                await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                logger.error(f"Ошибка отправки новости: {e}")
+                continue
         
-        self.conn.commit()
+        return sent_count
     
-    def get_keywords(self, user_id: int) -> tuple:
-        cursor = self.conn.cursor()
-        
-        cursor.execute(
-            "SELECT keyword FROM user_keywords WHERE user_id = ? AND is_negative = 0",
-            (user_id,)
-        )
-        keywords = [row[0] for row in cursor.fetchall()]
-        
-        cursor.execute(
-            "SELECT keyword FROM user_keywords WHERE user_id = ? AND is_negative = 1",
-            (user_id,)
-        )
-        negative_keywords = [row[0] for row in cursor.fetchall()]
-        
-        return keywords, negative_keywords
+    def stop_processing(self):
+        """Остановка обработки очереди"""
+        self.processing = False
     
-    # === Методы для новостей ===
-    def generate_news_hash(self, text: str, channel: str, message_id: int = None) -> str:
-        """Создает уникальный хеш для новости"""
-        if message_id:
-            content = f"{channel}:{message_id}".encode('utf-8')
-        else:
-            content = f"{channel}:{text[:200]}".encode('utf-8')
-        return hashlib.md5(content).hexdigest()
-    
-    def is_news_sent(self, user_id: int, news_hash: str) -> bool:
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "SELECT 1 FROM sent_news WHERE user_id = ? AND news_hash = ?",
-            (user_id, news_hash)
-        )
-        return cursor.fetchone() is not None
-    
-    def mark_news_sent(self, user_id: int, news_hash: str, channel: str, message_id: int = None):
-        cursor = self.conn.cursor()
-        cursor.execute(
-            '''INSERT OR IGNORE INTO sent_news 
-               (news_hash, user_id, channel_username, message_id) 
-               VALUES (?, ?, ?, ?)''',
-            (news_hash, user_id, channel, message_id)
-        )
-        self.conn.commit()
-    
-    # === Методы для статистики ===
-    def add_check_history(self, user_id: int, period_hours: int, 
-                         channels_checked: int, news_found: int, success: bool = True):
-        cursor = self.conn.cursor()
-        cursor.execute(
-            '''INSERT INTO check_history 
-               (user_id, period_hours, channels_checked, news_found, success)
-               VALUES (?, ?, ?, ?, ?)''',
-            (user_id, period_hours, channels_checked, news_found, 1 if success else 0)
-        )
-        self.conn.commit()
-    
-    def get_user_stats(self, user_id: int) -> dict:
-        cursor = self.conn.cursor()
-        
-        cursor.execute(
-            "SELECT COUNT(*) FROM user_channels WHERE user_id = ? AND is_active = 1",
-            (user_id,)
-        )
-        channels_count = cursor.fetchone()[0]
-        
-        cursor.execute(
-            "SELECT COUNT(*) FROM user_keywords WHERE user_id = ? AND is_negative = 0",
-            (user_id,)
-        )
-        keywords_count = cursor.fetchone()[0]
-        
-        cursor.execute(
-            "SELECT COUNT(*) FROM user_keywords WHERE user_id = ? AND is_negative = 1",
-            (user_id,)
-        )
-        negative_count = cursor.fetchone()[0]
-        
-        cursor.execute(
-            "SELECT COUNT(*) FROM sent_news WHERE user_id = ?",
-            (user_id,)
-        )
-        news_received = cursor.fetchone()[0]
-        
-        # Последняя проверка
-        cursor.execute(
-            "SELECT check_time, period_hours, news_found FROM check_history WHERE user_id = ? ORDER BY check_time DESC LIMIT 1",
-            (user_id,)
-        )
-        last_check = cursor.fetchone()
-        
+    def get_stats(self) -> Dict:
+        """Получение статистики очереди"""
         return {
-            'channels': channels_count,
-            'keywords': keywords_count,
-            'negative': negative_count,
-            'news_received': news_received,
-            'last_check': last_check
+            **self.stats,
+            'processing': self.processing
         }
 
-# Инициализация
-db = NewsBotDB()
-parser = TelegramWebParser()
-
-# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
-
-def analyze_message(text: str, keywords: List[str], negative_keywords: List[str]) -> Dict:
-    """Анализ сообщения на соответствие ключевым словам"""
-    text_lower = text.lower()
+# Класс для аналитики
+class UserAnalytics:
+    """Аналитика пользовательской активности"""
     
-    # Проверяем ключевые слова
-    found_keywords = []
-    for keyword in keywords:
-        if keyword.lower() in text_lower:
-            found_keywords.append(keyword)
+    def __init__(self, database):
+        self.db = database
     
-    # Проверяем слова-исключения
-    found_negative = []
-    for neg_keyword in negative_keywords:
-        if neg_keyword.lower() in text_lower:
-            found_negative.append(neg_keyword)
+    async def get_detailed_stats(self, user_id: int) -> Dict:
+        """Подробная статистика пользователя"""
+        basic_stats = db.get_user_stats(user_id)
+        channels = db.get_channels(user_id)
+        keywords, negative = db.get_keywords(user_id)
+        
+        # Анализ категорий интересов
+        categories = defaultdict(int)
+        for keyword in keywords:
+            category = NewsFormatter._determine_category([keyword])
+            categories[category] += 1
+        
+        # Форматируем категории
+        formatted_categories = []
+        for category, count in categories.items():
+            icon = config.CATEGORY_ICONS.get(category, '📝')
+            formatted_categories.append(f"{icon} {category}: {count}")
+        
+        return {
+            'basic': basic_stats,
+            'channels_count': len(channels),
+            'keywords_count': len(keywords),
+            'negative_count': len(negative),
+            'categories': formatted_categories,
+            'categories_raw': dict(categories),
+            'top_categories': sorted(categories.items(), key=lambda x: x[1], reverse=True)[:3]
+        }
+
+# Глобальные объекты
+news_queue = None
+analytics = UserAnalytics(db)
+
+# Клавиатуры
+def get_main_keyboard() -> ReplyKeyboardMarkup:
+    """Основная клавиатура с улучшенным дизайном"""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔍 Проверить новости"), KeyboardButton(text="📊 Статистика")],
+            [KeyboardButton(text="📢 Мои каналы"), KeyboardButton(text="🏷️ Мои теги")],
+            [KeyboardButton(text="➕ Добавить канал"), KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="📈 Аналитика"), KeyboardButton(text="❓ Помощь")]
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Выберите действие...",
+        selective=True
+    )
+
+def get_channels_keyboard(channels: List[str]) -> InlineKeyboardMarkup:
+    """Клавиатура для управления каналами с пагинацией"""
+    builder = InlineKeyboardBuilder()
     
-    return {
-        'has_keywords': len(found_keywords) > 0,
-        'has_negative': len(found_negative) > 0,
-        'keywords': found_keywords,
-        'negative': found_negative,
-        'relevant': len(found_keywords) > 0 and len(found_negative) == 0
-    }
+    for i, channel in enumerate(channels[:10], 1):
+        builder.button(
+            text=f"{i}. ❌ @{channel}",
+            callback_data=f"remove_channel:{channel}"
+        )
+    
+    builder.adjust(2)  # 2 кнопки в ряд
+    
+    # Кнопки действий
+    builder.row(
+        InlineKeyboardButton(text="📥 Добавить еще", callback_data="add_more_channels"),
+        InlineKeyboardButton(text="🔄 Проверить все", callback_data="check_all_channels")
+    )
+    
+    return builder.as_markup()
 
-def format_period_text(hours: int) -> str:
-    """Форматирование текста периода"""
-    if hours == 0:
-        return "всю историю"
-    elif hours == 1:
-        return "последний час"
-    elif hours < 24:
-        return f"последние {hours} часов"
-    elif hours == 24:
-        return "последние 24 часа"
-    elif hours < 168:  # 7 дней
-        days = hours // 24
-        return f"последние {days} дней"
-    else:
-        weeks = hours // 168
-        return f"последние {weeks} недель"
+def get_settings_keyboard() -> InlineKeyboardMarkup:
+    """Улучшенная клавиатура настроек"""
+    builder = InlineKeyboardBuilder()
+    
+    builder.button(text="✏️ Изменить теги", callback_data="edit_keywords")
+    builder.button(text="⚖️ Весовые теги", callback_data="edit_weighted_keywords")
+    builder.button(text="🚫 Исключения", callback_data="edit_negative")
+    builder.button(text="📁 Категории", callback_data="manage_categories")
+    builder.button(text="❓ Как работает поиск", callback_data="how_it_works")
+    builder.button(text="📊 Статистика парсера", callback_data="parser_stats")
+    
+    builder.adjust(2, 2, 1, 1)  # Распределение по рядам
+    
+    return builder.as_markup()
 
-def get_period_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура для выбора периода"""
+def get_analytics_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура аналитики"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🕐 1 час", callback_data="period:1"),
-            InlineKeyboardButton(text="🕑 3 часа", callback_data="period:3"),
-            InlineKeyboardButton(text="🕒 6 часов", callback_data="period:6"),
+            InlineKeyboardButton(text="📅 Активность", callback_data="analytics_activity"),
+            InlineKeyboardButton(text="🏷️ Категории", callback_data="analytics_categories")
         ],
         [
-            InlineKeyboardButton(text="🕓 12 часов", callback_data="period:12"),
-            InlineKeyboardButton(text="🕔 24 часа", callback_data="period:24"),
-            InlineKeyboardButton(text="🕕 3 дня", callback_data="period:72"),
-        ],
-        [
-            InlineKeyboardButton(text="🕖 Неделя", callback_data="period:168"),
-            InlineKeyboardButton(text="🕗 Всегда", callback_data="period:0"),
-            InlineKeyboardButton(text="✏️ Свое", callback_data="period:custom"),
+            InlineKeyboardButton(text="📢 Топ каналы", callback_data="analytics_top_channels"),
+            InlineKeyboardButton(text="🎯 Рекомендации", callback_data="analytics_recommendations")
         ]
     ])
 
-# ==================== ОСНОВНОЙ БОТ ====================
+# ==================== КОМАНДЫ ====================
 
-async def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    """Команда /start"""
+    user_id = message.from_user.id
+    db.add_user(user_id, message.from_user.username, message.from_user.first_name)
+    
+    welcome_text = config.WELCOME_MESSAGE.format(name=message.from_user.first_name)
+    
+    await message.answer(
+        welcome_text, 
+        parse_mode=ParseMode.HTML, 
+        reply_markup=get_main_keyboard(),
+        disable_notification=True
     )
-    logger = logging.getLogger(__name__)
     
-    logger.info("🚀 Запуск бота с Telegram Web парсингом...")
+    # Предлагаем начать с добавления канала
+    channels = db.get_channels(user_id)
+    if not channels:
+        await message.answer(
+            "🎯 <b>Быстрый старт:</b>\n\n"
+            "1. Отправьте @username канала\n"
+            "2. Настройте теги\n"
+            "3. Проверьте новости\n\n"
+            "<i>Пример канала:</i> <code>@tproger</code>",
+            parse_mode=ParseMode.HTML
+        )
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    """Команда /help"""
+    await message.answer(config.HELP_MESSAGE, parse_mode=ParseMode.HTML)
+
+@router.message(Command("analytics"))
+async def cmd_analytics(message: Message):
+    """Команда /analytics - детальная аналитика"""
+    user_id = message.from_user.id
+    stats = await analytics.get_detailed_stats(user_id)
     
-    # Создаем сессию с прокси
-    session = AiohttpSession(proxy=(PROXY_URL, PROXY_AUTH))
-    bot = Bot(token=BOT_TOKEN, session=session)
-    dp = Dispatcher(storage=MemoryStorage())
+    analytics_text = "📈 <b>Детальная аналитика</b>\n\n"
     
-    # ==================== КЛАВИАТУРЫ ====================
+    # Основная статистика
+    analytics_text += f"<b>Основные показатели:</b>\n"
+    analytics_text += f"• 📢 Каналов: {stats['basic']['channels']}\n"
+    analytics_text += f"• 🏷️ Тегов: {stats['keywords_count']}\n"
+    analytics_text += f"• 🚫 Исключений: {stats['negative_count']}\n"
+    analytics_text += f"• 📨 Отправлено новостей: {stats['basic']['sent_news']}\n\n"
     
-    def get_main_keyboard() -> ReplyKeyboardMarkup:
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="🔍 Проверить новости"), KeyboardButton(text="📊 Статистика")],
-                [KeyboardButton(text="📢 Мои каналы"), KeyboardButton(text="🏷️ Мои теги")],
-                [KeyboardButton(text="➕ Добавить канал"), KeyboardButton(text="⚙️ Настройки")]
-            ],
-            resize_keyboard=True,
-            input_field_placeholder="Выберите действие..."
+    # Категории интересов
+    if stats['categories']:
+        analytics_text += f"<b>Ваши интересы по категориям:</b>\n"
+        for category in stats['categories']:
+            analytics_text += f"• {category}\n"
+    
+    await message.answer(
+        analytics_text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_analytics_keyboard()
+    )
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    """Панель администратора"""
+    if message.from_user.id != config.ADMIN_ID:
+        await message.answer("⛔ Доступ запрещен")
+        return
+    
+    admin_text = "⚙️ <b>Панель администратора</b>\n\n"
+    
+    # Статистика системы
+    parser_stats = parser.get_stats()
+    
+    admin_text += f"<b>Статистика парсера:</b>\n"
+    admin_text += f"• Успешных запросов: {parser_stats.get('success', 0)}\n"
+    admin_text += f"• Ошибок: {parser_stats.get('failures', 0)}\n"
+    admin_text += f"• Таймаутов: {parser_stats.get('timeouts', 0)}\n"
+    
+    cache_stats = parser_stats.get('cache_stats', {})
+    admin_text += f"• Хит-рейт кэша: {cache_stats.get('hit_rate', 0):.1%}\n\n"
+    
+    # Статистика очереди
+    global news_queue
+    if news_queue:
+        queue_stats = news_queue.get_stats()
+        admin_text += f"<b>Очередь отправки:</b>\n"
+        admin_text += f"• Отправлено: {queue_stats.get('sent', 0)}\n"
+        admin_text += f"• В очереди: {queue_stats.get('queue_size', 0)}\n"
+        admin_text += f"• Ошибок: {queue_stats.get('failed', 0)}\n"
+    
+    await message.answer(admin_text, parse_mode=ParseMode.HTML)
+
+@router.message(Command("channels"))
+async def cmd_channels(message: Message):
+    """Команда /channels - список каналов"""
+    user_id = message.from_user.id
+    channels = db.get_channels(user_id)
+    
+    if not channels:
+        await message.answer(
+            "📭 <b>У вас еще нет каналов</b>\n\n"
+            "Добавьте каналы одним из способов:\n"
+            "1. Через кнопку «➕ Добавить канал»\n"
+            "2. Отправьте @username канала\n"
+            "3. Пример: <code>@tproger</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    channels_text = "📢 <b>Ваши каналы:</b>\n\n"
+    for i, channel in enumerate(channels, 1):
+        channels_text += f"{i}. @{channel}\n"
+    
+    channels_text += f"\n<b>Всего:</b> {len(channels)} каналов"
+    
+    await message.answer(
+        channels_text, 
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_channels_keyboard(channels)
+    )
+
+@router.message(Command("tags"))
+async def cmd_tags(message: Message):
+    """Команда /tags - показать теги"""
+    user_id = message.from_user.id
+    keywords, negative = db.get_keywords(user_id)
+    
+    # Используем теги по умолчанию если нет своих
+    if not keywords:
+        keywords = config.DEFAULT_KEYWORDS
+    
+    keywords_text = ", ".join(keywords) if keywords else "не заданы"
+    negative_text = ", ".join(negative) if negative else "не заданы"
+    
+    await message.answer(
+        f"🏷️ <b>Ваши теги и фильтры</b>\n\n"
+        f"<b>🔍 Ключевые слова для поиска:</b>\n"
+        f"<code>{escape_html(keywords_text)}</code>\n\n"
+        f"<b>🚫 Слова-исключения:</b>\n"
+        f"<code>{escape_html(negative_text)}</code>\n\n"
+        f"<i>Бот будет искать сообщения с ключевыми словами,\n"
+        f"но без слов-исключений.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_settings_keyboard()
+    )
+
+@router.message(Command("stats"))
+async def cmd_stats_command(message: Message):
+    """Команда /stats - статистика"""
+    user_id = message.from_user.id
+    stats = db.get_user_stats(user_id)
+    channels = db.get_channels(user_id)
+    
+    stats_text = f"📊 <b>Ваша статистика</b>\n\n"
+    stats_text += f"<b>📢 Каналов:</b> {stats['channels']}\n"
+    stats_text += f"<b>🏷️ Ключевых слов:</b> {stats['keywords']}\n"
+    stats_text += f"<b>🚫 Исключений:</b> {stats['negative_keywords']}\n"
+    stats_text += f"<b>📨 Отправлено новостей:</b> {stats['sent_news']}\n\n"
+    
+    if channels:
+        stats_text += f"<b>Последние каналы:</b>\n"
+        for i, channel in enumerate(channels[:5], 1):
+            stats_text += f"{i}. @{channel}\n"
+    
+    await message.answer(stats_text, parse_mode=ParseMode.HTML)
+
+# ==================== КНОПКИ ====================
+
+@router.message(F.text == "📈 Аналитика")
+async def cmd_analytics_button(message: Message):
+    """Кнопка аналитики"""
+    await cmd_analytics(message)
+
+@router.message(F.text == "🔍 Проверить новости")
+async def cmd_check_news(message: Message):
+    """Улучшенная проверка новостей"""
+    user_id = message.from_user.id
+    channels = db.get_channels(user_id)
+    
+    if not channels:
+        await message.answer(
+            "❌ <b>У вас нет каналов для проверки</b>\n\n"
+            "Добавьте хотя бы один канал через\n"
+            "кнопку «➕ Добавить канал»",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    keywords, negative = db.get_keywords(user_id)
+    if not keywords:
+        keywords = config.DEFAULT_KEYWORDS
+    
+    # Создаем взвешенные ключевые слова
+    weighted_keywords = [(kw, 1.0) for kw in keywords]
+    
+    # Статус начала проверки
+    status_msg = await message.answer(
+        f"🔍 <b>Начинаю умную проверку...</b>\n\n"
+        f"<b>Каналов:</b> {len(channels)}\n"
+        f"<b>Ключевых слов:</b> {len(keywords)}\n"
+        f"<b>Исключений:</b> {len(negative)}\n\n"
+        f"<i>Используется улучшенный алгоритм поиска...</i>",
+        parse_mode=ParseMode.HTML
+    )
+    
+    total_found = 0
+    found_by_channel = {}
+    
+    # Проверяем каждый канал
+    for i, channel in enumerate(channels, 1):
+        try:
+            # Получаем только свежие сообщения (за последние 24 часа)
+            messages = await parser.get_fresh_messages(channel, hours=24, limit=20)
+            
+            channel_news = []
+            
+            for msg in messages:
+                # Анализируем с улучшенным алгоритмом
+                analysis = RelevanceAnalyzer.analyze_message(
+                    msg['text'],
+                    weighted_keywords,
+                    negative
+                )
+                
+                if analysis['relevant'] and not analysis['has_negative']:
+                    news_hash = db.generate_news_hash(msg['text'], channel, msg.get('id'))
+                    
+                    if not db.is_news_sent(user_id, news_hash):
+                        channel_news.append({
+                            'message': msg,
+                            'analysis': analysis,
+                            'hash': news_hash
+                        })
+            
+            if channel_news:
+                # Добавляем в очередь отправки
+                global news_queue
+                if news_queue:
+                    await news_queue.add_news_batch(user_id, channel_news)
+                found_by_channel[channel] = len(channel_news)
+                total_found += len(channel_news)
+            
+            # Обновляем статус каждые 3 канала
+            if i % 3 == 0 or i == len(channels):
+                progress_text = (
+                    f"🔍 <b>Проверяю...</b>\n\n"
+                    f"<b>Прогресс:</b> {i}/{len(channels)}\n"
+                    f"<b>Найдено новостей:</b> {total_found}\n"
+                )
+                
+                if found_by_channel:
+                    progress_text += f"<b>Каналы с новостями:</b> {len(found_by_channel)}"
+                
+                try:
+                    await status_msg.edit_text(progress_text, parse_mode=ParseMode.HTML)
+                except:
+                    pass
+            
+            # Небольшая пауза между каналами
+            await asyncio.sleep(0.5)
+            
+        except Exception as e:
+            logger.error(f"Ошибка проверки канала @{channel}: {e}")
+            continue
+    
+    # Итоговый результат
+    if total_found > 0:
+        result_text = (
+            f"✅ <b>Проверка завершена!</b>\n\n"
+            f"<b>Найдено новых сообщений:</b> {total_found}\n"
+            f"<b>Каналов с новостей:</b> {len(found_by_channel)}\n"
+            f"<b>Всего проверено:</b> {len(channels)}\n\n"
+        )
+        
+        # Показываем топ каналов
+        if found_by_channel:
+            top_channels = sorted(found_by_channel.items(), key=lambda x: x[1], reverse=True)[:3]
+            result_text += "<b>Топ каналов:</b>\n"
+            for channel, count in top_channels:
+                result_text += f"• @{channel}: {count} новостей\n"
+        
+        result_text += "\n<i>Новости отправляются в фоновом режиме...</i>"
+        
+    else:
+        result_text = (
+            f"📭 <b>Новых сообщений не найдено</b>\n\n"
+            f"<b>Проверено каналов:</b> {len(channels)}\n"
+            f"<b>Период:</b> последние 24 часа\n\n"
+            f"<i>Советы:</i>\n"
+            f"• Добавьте больше ключевых слов\n"
+            f"• Расширьте список каналов\n"
+            f"• Проверьте настройки исключений\n"
+            f"• Попробуйте весовые ключевые слова"
         )
     
-    # ==================== КОМАНДЫ БОТА ====================
+    await message.answer(result_text, parse_mode=ParseMode.HTML)
     
-    @dp.message(Command("start"))
-    async def cmd_start(message: Message):
-        """Команда /start"""
-        user_id = message.from_user.id
-        db.add_user(user_id, message.from_user.username, message.from_user.first_name)
-        
-        welcome_text = (
-            f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
-            f"🤖 Я бот для мониторинга Telegram-каналов.\n\n"
-            f"<b>📡 Использую:</b> Telegram Web парсинг\n"
-            f"<b>✅ Работает на:</b> PythonAnywhere\n"
-            f"<b>🎯 Проверяю:</b> публичные каналы\n\n"
-            f"<b>Начните с кнопки '➕ Добавить канал'</b>"
+    # Предлагаем улучшения
+    if total_found == 0 and len(keywords) < 5:
+        await message.answer(
+            "💡 <b>Совет:</b> Добавьте больше ключевых слов (минимум 5)\n"
+            "Используйте кнопку «⚖️ Весовые теги» для точной настройки",
+            parse_mode=ParseMode.HTML
+        )
+
+@router.message(F.text.startswith("@"))
+async def handle_channel_input(message: Message, state: FSMContext):
+    """Улучшенная обработка ввода канала"""
+    channel = message.text.strip()
+    user_id = message.from_user.id
+    
+    # Проверяем формат
+    if not re.match(r'^@[a-zA-Z0-9_]{5,32}$', channel):
+        await message.answer(
+            "❌ <b>Некорректный формат</b>\n\n"
+            "Username канала должен:\n"
+            "• Начинаться с @\n"
+            "• Содержать только буквы, цифры и _\n"
+            "• Быть от 5 до 32 символов\n\n"
+            "<b>Пример:</b> <code>@tproger</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # Проверяем существование канала с детальной информацией
+    await message.answer(f"🔍 Проверяю канал {channel}...")
+    
+    exists, info = await parser.check_channel_exists(channel)
+    
+    if not exists:
+        await message.answer(
+            f"❌ <b>Не удалось добавить канал</b>\n\n"
+            f"<b>Причина:</b> {info}\n\n"
+            f"<i>Убедитесь что канал публичный и username указан правильно</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # Добавляем канал
+    if db.add_channel(user_id, channel):
+        response = (
+            f"✅ <b>Канал {channel} успешно добавлен!</b>\n\n"
+            f"{info}\n\n"
         )
         
-        await message.answer(welcome_text, parse_mode="HTML", reply_markup=get_main_keyboard())
-    
-    @dp.message(F.text == "🔍 Проверить новости")
-    async def cmd_check_news(message: Message):
-        """Проверка новостей - выбор периода"""
-        user_id = message.from_user.id
-        
-        # Проверяем, есть ли каналы
-        channels = db.get_channels(user_id)
-        if not channels:
-            await message.answer(
-                "❌ <b>У вас нет каналов для проверки</b>\n\n"
-                "Добавьте каналы через кнопку '➕ Добавить канал'",
-                parse_mode="HTML"
-            )
-            return
-        
-        # Проверяем, есть ли ключевые слова
+        # Проверяем настройки пользователя
         keywords, _ = db.get_keywords(user_id)
         if not keywords:
-            await message.answer(
-                "⚠️ <b>У вас не заданы ключевые слова</b>\n\n"
-                "Используются значения по умолчанию:\n"
-                "<code>технологии, программирование, стартап</code>\n\n"
-                "Настройте теги через кнопку '🏷️ Мои теги'",
-                parse_mode="HTML"
+            response += (
+                f"💡 <b>Совет:</b> Настройте ключевые слова для поиска\n"
+                f"Используйте «🏷️ Мои теги» → «✏️ Изменить теги»\n\n"
+                f"<i>Без ключевых слов бот не будет находить релевантные новости</i>"
+            )
+        else:
+            response += (
+                f"Теперь можете проверить новости через «🔍 Проверить новости»\n"
+                f"или настроить параметры поиска в «⚙️ Настройки»"
             )
         
+        await message.answer(response, parse_mode=ParseMode.HTML)
+    else:
         await message.answer(
-            "🔍 <b>За какой период проверять новости?</b>\n\n"
-            "Выберите период времени для поиска:",
-            parse_mode="HTML",
-            reply_markup=get_period_keyboard()
+            f"ℹ️ Канал {channel} уже был добавлен ранее\n\n"
+            f"Используйте «📢 Мои каналы» для просмотра списка",
+            parse_mode=ParseMode.HTML
         )
     
-    @dp.callback_query(F.data.startswith("period:"))
-    async def callback_period_selected(callback: types.CallbackQuery, state: FSMContext):
-        """Обработка выбора периода"""
-        period_data = callback.data.split(":")[1]
-        
-        if period_data == "custom":
-            await callback.message.edit_text(
-                "✏️ <b>Введите количество часов:</b>\n\n"
-                "Примеры:\n"
-                "• <code>2</code> - за последние 2 часа\n"
-                "• <code>48</code> - за последние 2 дня\n"
-                "• <code>0</code> - всю историю (все доступные сообщения)\n\n"
-                "Или отправьте 'отмена' для отмены",
-                parse_mode="HTML"
-            )
-            await state.set_state(UserStates.waiting_for_custom_period)
+    await state.clear()
+
+@router.message(F.text == "➕ Добавить канал")
+async def cmd_add_channel(message: Message, state: FSMContext):
+    """Добавление канала"""
+    await message.answer(
+        "➕ <b>Добавление канала</b>\n\n"
+        "Отправьте username канала в формате:\n"
+        "<code>@username</code>\n\n"
+        "<b>Примеры:</b>\n"
+        "<code>@tproger</code> - канал о программировании\n"
+        "<code>@vcru</code> - Venture Capital\n"
+        "<code>@roem_news</code> - IT новости\n\n"
+        "<i>Канал должен быть публичным</i>",
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(UserStates.waiting_for_channel)
+
+@router.message(F.text == "📢 Мои каналы")
+async def cmd_my_channels(message: Message):
+    """Мои каналы"""
+    user_id = message.from_user.id
+    channels = db.get_channels(user_id)
+    
+    if not channels:
+        await message.answer(
+            "📭 <b>У вас еще нет каналов</b>\n\n"
+            "Добавьте каналы через кнопку «➕ Добавить канал»\n"
+            "или отправьте @username канала",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    channels_text = "📢 <b>Ваши каналы:</b>\n\n"
+    for i, channel in enumerate(channels, 1):
+        channels_text += f"{i}. @{channel}\n"
+    
+    channels_text += f"\n<b>Всего:</b> {len(channels)} каналов"
+    
+    await message.answer(
+        channels_text, 
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_channels_keyboard(channels)
+    )
+
+@router.message(F.text == "🏷️ Мои теги")
+async def cmd_my_tags(message: Message):
+    """Мои теги"""
+    user_id = message.from_user.id
+    keywords, negative = db.get_keywords(user_id)
+    
+    # Используем теги по умолчанию если нет своих
+    if not keywords:
+        keywords = config.DEFAULT_KEYWORDS
+    
+    keywords_text = ", ".join(keywords) if keywords else "не заданы"
+    negative_text = ", ".join(negative) if negative else "не заданы"
+    
+    await message.answer(
+        f"🏷️ <b>Ваши теги и фильтры</b>\n\n"
+        f"<b>🔍 Ключевые слова для поиска:</b>\n"
+        f"<code>{escape_html(keywords_text)}</code>\n\n"
+        f"<b>🚫 Слова-исключения:</b>\n"
+        f"<code>{escape_html(negative_text)}</code>\n\n"
+        f"<i>Бот будет искать сообщения с ключевыми словами,\n"
+        f"но без слов-исключений.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_settings_keyboard()
+    )
+
+@router.message(F.text == "📊 Статистика")
+async def cmd_stats(message: Message):
+    """Статистика"""
+    user_id = message.from_user.id
+    stats = db.get_user_stats(user_id)
+    channels = db.get_channels(user_id)
+    
+    stats_text = f"📊 <b>Ваша статистика</b>\n\n"
+    stats_text += f"<b>📢 Каналов:</b> {stats['channels']}\n"
+    stats_text += f"<b>🏷️ Ключевых слов:</b> {stats['keywords']}\n"
+    stats_text += f"<b>🚫 Исключений:</b> {stats['negative_keywords']}\n"
+    stats_text += f"<b>📨 Отправлено новостей:</b> {stats['sent_news']}\n\n"
+    
+    if channels:
+        stats_text += f"<b>Последние каналы:</b>\n"
+        for i, channel in enumerate(channels[:5], 1):
+            stats_text += f"{i}. @{channel}\n"
+    
+    await message.answer(stats_text, parse_mode=ParseMode.HTML)
+
+@router.message(F.text == "⚙️ Настройки")
+async def cmd_settings(message: Message):
+    """Настройки"""
+    await message.answer(
+        "⚙️ <b>Настройки бота</b>\n\n"
+        "Выберите действие:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_settings_keyboard()
+    )
+
+@router.message(F.text == "❓ Помощь")
+async def cmd_help_button(message: Message):
+    """Кнопка помощи"""
+    await cmd_help(message)
+
+# ==================== CALLBACK HANDLERS ====================
+
+@router.callback_query(F.data == "edit_keywords")
+async def callback_edit_keywords(callback: CallbackQuery, state: FSMContext):
+    """Редактирование ключевых слов"""
+    await callback.message.answer(
+        "✏️ <b>Введите ключевые слова:</b>\n\n"
+        "<b>Формат:</b> слова через запятую\n"
+        "<b>Пример:</b> технологии, программирование, стартап, инвестиции\n\n"
+        "<i>Бот будет искать эти слова в сообщениях</i>",
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(UserStates.waiting_for_keywords)
+    await callback.answer()
+
+@router.callback_query(F.data == "edit_weighted_keywords")
+async def callback_edit_weighted_keywords(callback: CallbackQuery, state: FSMContext):
+    """Редактирование весовых ключевых слов"""
+    await callback.message.answer(
+        "⚖️ <b>Введите ключевые слова с весами:</b>\n\n"
+        "<b>Формат:</b> слово:вес, слово:вес\n"
+        "<b>Пример:</b> технологии:2.0, программирование:1.5, ИИ:3.0\n\n"
+        "<i>Вес от 0.1 до 5.0 (по умолчанию 1.0)\n"
+        "Чем выше вес, тем важнее ключевое слово</i>",
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(UserStates.waiting_for_weighted_keywords)
+    await callback.answer()
+
+@router.callback_query(F.data == "edit_negative")
+async def callback_edit_negative(callback: CallbackQuery, state: FSMContext):
+    """Редактирование исключений"""
+    await callback.message.answer(
+        "🚫 <b>Введите слова-исключения:</b>\n\n"
+        "<b>Формат:</b> слова через запятую\n"
+        "<b>Пример:</b> смерть, авария, преступление, война\n\n"
+        "<i>Сообщения с этими словами будут игнорироваться</i>",
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(UserStates.waiting_for_negative)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("remove_channel:"))
+async def callback_remove_channel(callback: CallbackQuery):
+    """Удаление канала"""
+    channel = callback.data.split(":")[1]
+    user_id = callback.from_user.id
+    
+    if db.remove_channel(user_id, channel):
+        await callback.message.edit_text(
+            f"✅ Канал @{channel} удален\n\n"
+            f"Обновите список каналов командой /channels",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await callback.answer("❌ Канал не найден", show_alert=True)
+
+@router.callback_query(F.data == "how_it_works")
+async def callback_how_it_works(callback: CallbackQuery):
+    """Как работает поиск"""
+    await callback.answer()
+    await callback.message.answer(
+        "🤔 <b>Как работает поиск?</b>\n\n"
+        "1. <b>Сбор сообщений</b> - бот получает последние сообщения из ваших каналов\n"
+        "2. <b>Анализ текста</b> - ищет ваши ключевые слова в каждом сообщении\n"
+        "3. <b>Фильтрация</b> - отбрасывает сообщения со словами-исключениями\n"
+        "4. <b>Проверка повторов</b> - не показывает уже отправленные новости\n"
+        "5. <b>Отправка</b> - отправляет подходящие сообщения вам\n\n"
+        "<i>Поиск учитывает границы слов и регистр не важен</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+@router.callback_query(F.data == "add_more_channels")
+async def callback_add_more_channels(callback: CallbackQuery):
+    """Добавить еще каналов"""
+    await callback.answer()
+    await callback.message.answer(
+        "Отправьте @username канала для добавления\n"
+        "Пример: <code>@tproger</code>",
+        parse_mode=ParseMode.HTML
+    )
+
+@router.callback_query(F.data == "parser_stats")
+async def callback_parser_stats(callback: CallbackQuery):
+    """Статистика парсера"""
+    stats = parser.get_stats()
+    
+    stats_text = "📊 <b>Статистика парсера</b>\n\n"
+    stats_text += f"<b>Запросы:</b>\n"
+    stats_text += f"• ✅ Успешных: {stats.get('success', 0)}\n"
+    stats_text += f"• ❌ Ошибок: {stats.get('failures', 0)}\n"
+    stats_text += f"• ⏱️ Таймаутов: {stats.get('timeouts', 0)}\n\n"
+    
+    cache_stats = stats.get('cache_stats', {})
+    stats_text += f"<b>Кэш:</b>\n"
+    stats_text += f"• Размер: {cache_stats.get('size', 0)} записей\n"
+    stats_text += f"• Хитов: {cache_stats.get('hits', 0)}\n"
+    stats_text += f"• Промахов: {cache_stats.get('misses', 0)}\n"
+    stats_text += f"• Хит-рейт: {cache_stats.get('hit_rate', 0):.1%}\n"
+    
+    await callback.message.answer(stats_text, parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+@router.callback_query(F.data == "analytics_recommendations")
+async def callback_analytics_recommendations(callback: CallbackQuery):
+    """Рекомендации на основе аналитики"""
+    user_id = callback.from_user.id
+    stats = await analytics.get_detailed_stats(user_id)
+    
+    recommendations = []
+    
+    # Рекомендации на основе категорий
+    top_categories = stats.get('top_categories', [])
+    if top_categories:
+        for category, count in top_categories[:2]:
+            icon = config.CATEGORY_ICONS.get(category, '📝')
+            
+            # Рекомендуем каналы по категории
+            if category == 'technology':
+                recommendations.append(f"{icon} Попробуйте каналы: @tproger, @habr_com")
+            elif category == 'business':
+                recommendations.append(f"{icon} Попробуйте каналы: @vcru, @rbcdaily")
+            elif category == 'news':
+                recommendations.append(f"{icon} Попробуйте каналы: @rian_ru, @meduzalive")
+    
+    # Рекомендации по количеству каналов
+    if stats['channels_count'] < 3:
+        recommendations.append("💡 Добавьте больше каналов (минимум 3 для лучшего покрытия)")
+    
+    # Рекомендации по ключевым словам
+    if stats['keywords_count'] < 5:
+        recommendations.append("💡 Добавьте больше ключевых слов (рекомендуется 5-10)")
+    
+    # Формируем ответ
+    if recommendations:
+        response = "🎯 <b>Персональные рекомендации</b>\n\n"
+        response += "\n".join(recommendations)
+    else:
+        response = "🤔 <b>Пока нет рекомендаций</b>\n\nДобавьте больше данных для персонализированных советов"
+    
+    await callback.message.answer(response, parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("analytics_"))
+async def handle_analytics_callbacks(callback: CallbackQuery):
+    """Обработка callback-ов аналитики"""
+    action = callback.data.split("_")[1]
+    user_id = callback.from_user.id
+    
+    if action == "activity":
+        await callback.answer("Функция в разработке", show_alert=True)
+    elif action == "categories":
+        stats = await analytics.get_detailed_stats(user_id)
+        if stats['categories']:
+            text = "🏷️ <b>Ваши интересы по категориям</b>\n\n"
+            text += "\n".join(stats['categories'])
+            await callback.message.answer(text, parse_mode=ParseMode.HTML)
         else:
-            try:
-                hours = int(period_data)
-                await start_news_check(callback.message, hours, callback.from_user.id)
-                await callback.message.delete()
-            except ValueError:
-                await callback.answer("❌ Ошибка выбора периода")
-        
-        await callback.answer()
+            await callback.answer("Нет данных о категориях", show_alert=True)
+    elif action == "top_channels":
+        await callback.answer("Функция в разработке", show_alert=True)
+
+# ==================== ОБРАБОТКА СОСТОЯНИЙ ====================
+
+@router.message(UserStates.waiting_for_keywords)
+async def process_keywords_input(message: Message, state: FSMContext):
+    """Обработка ввода ключевых слов"""
+    raw_keywords = [word.strip() for word in message.text.split(',')]
+    keywords = [word for word in raw_keywords if word and len(word) >= 2]
     
-    @dp.message(UserStates.waiting_for_custom_period)
-    async def process_custom_period(message: Message, state: FSMContext):
-        """Обработка введенного периода"""
-        if message.text.lower() in ['отмена', 'cancel', 'назад']:
-            await message.answer("❌ Ввод периода отменен", reply_markup=get_main_keyboard())
-            await state.clear()
-            return
+    if not keywords:
+        await message.answer(
+            "❌ <b>Не найдено ключевых слов</b>\n\n"
+            "Введите хотя бы одно слово длиной от 2 символов\n"
+            "<b>Пример:</b> технологии, программирование",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    if len(keywords) > 20:
+        await message.answer(
+            "❌ <b>Слишком много ключевых слов</b>\n\n"
+            "Максимум 20 слов\n"
+            "Выберите самые важные",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    user_id = message.from_user.id
+    db.set_keywords(user_id, keywords, is_negative=False)
+    await state.clear()
+    
+    await message.answer(
+        f"✅ <b>Ключевые слова обновлены!</b>\n\n"
+        f"<b>Новый список ({len(keywords)} слов):</b>\n"
+        f"<code>{escape_html(', '.join(keywords))}</code>\n\n"
+        f"<i>Теперь проверьте новости через «🔍 Проверить новости»</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+@router.message(UserStates.waiting_for_weighted_keywords)
+async def process_weighted_keywords_input(message: Message, state: FSMContext):
+    """Обработка ввода весовых ключевых слов"""
+    try:
+        weighted_keywords = RelevanceAnalyzer.parse_weighted_keywords(message.text)
         
-        try:
-            hours = int(message.text.strip())
-            if hours < 0:
-                raise ValueError
-            
-            await start_news_check(message, hours, message.from_user.id)
-            await state.clear()
-            
-        except ValueError:
+        if not weighted_keywords:
             await message.answer(
-                "❌ <b>Некорректное значение</b>\n\n"
-                "Введите целое число (часы):\n"
-                "<code>12</code> - за 12 часов\n"
-                "<code>0</code> - всю историю",
-                parse_mode="HTML"
+                "❌ <b>Не найдено ключевых слов</b>\n\n"
+                "Введите хотя бы одно слово\n"
+                "<b>Пример:</b> технологии:2.0, программирование:1.5",
+                parse_mode=ParseMode.HTML
             )
-    
-    @dp.message(UserStates.waiting_for_keywords)
-    async def process_keywords_input(message: Message, state: FSMContext):
-        """Обработка ввода ключевых слов"""
-        if not message.text.strip():
-            await message.answer("❌ Вы отправили пустое сообщение. Пожалуйста, введите слова через запятую.")
             return
-    
-        # Очищаем и разбиваем ввод пользователя
-        raw_keywords = [word.strip().lower() for word in message.text.split(',')]
-        keywords = [word for word in raw_keywords if word]  # Убираем пустые строки
-    
-        if not keywords:
-            await message.answer("❌ Не найдено ключевых слов. Попробуйте снова. Пример: <code>технологии, программирование</code>", parse_mode="HTML")
+        
+        if len(weighted_keywords) > 20:
+            await message.answer(
+                "❌ <b>Слишком много ключевых слов</b>\n\n"
+                "Максимум 20 слов\n"
+                "Выберите самые важные",
+                parse_mode=ParseMode.HTML
+            )
             return
-    
-        # Сохраняем в базу данных
+        
         user_id = message.from_user.id
+        keywords = [kw[0] for kw in weighted_keywords]
+        
+        # Сохраняем плоский список (для обратной совместимости)
         db.set_keywords(user_id, keywords, is_negative=False)
-    
-        # Сбрасываем состояние
-        await state.clear()
-    
-        await message.answer(
-            f"✅ Ключевые слова успешно обновлены!\n\n"
-            f"<b>Новый список:</b>\n<code>{', '.join(keywords)}</code>",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard()  # Возвращаем главное меню
-        )
-
-    @dp.message(UserStates.waiting_for_negative)
-    async def process_negative_input(message: Message, state: FSMContext):
-        """Обработка ввода слов-исключений"""
-        if not message.text.strip():
-            await message.answer("❌ Вы отправили пустое сообщение. Пожалуйста, введите слова через запятую.")
-            return
-    
-        # Очищаем и разбиваем ввод пользователя
-        raw_negatives = [word.strip().lower() for word in message.text.split(',')]
-        negatives = [word for word in raw_negatives if word]  # Убираем пустые строки
-    
-        # Сохраняем в базу данных
-        user_id = message.from_user.id
-        db.set_keywords(user_id, negatives, is_negative=True)
-    
-        # Сбрасываем состояние
-        await state.clear()
-    
-        await message.answer(
-            f"✅ Слова-исключения успешно обновлены!\n\n"
-            f"<b>Новый список:</b>\n<code>{', '.join(negatives) if negatives else 'список пуст'}</code>",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard()  # Возвращаем главное меню
-        )
-    
-    async def start_news_check(message: Message, period_hours: int, user_id: int):
-        """Запуск проверки новостей"""
-        # Обновляем время последней проверки
-        db.update_last_check(user_id)
         
-        # Получаем данные пользователя
-        channels = db.get_channels(user_id)
-        keywords, negative_keywords = db.get_keywords(user_id)
-        
-        # Если нет ключевых слов - используем значения по умолчанию
-        if not keywords:
-            keywords = ["технологии", "программирование", "стартап"]
-            db.set_keywords(user_id, keywords, is_negative=False)
-        
-        period_text = format_period_text(period_hours)
-        
-        # Отправляем сообщение о начале проверки
-        progress_msg = await message.answer(
-            f"🔍 <b>Начинаю проверку...</b>\n\n"
-            f"<b>Период:</b> {period_text}\n"
-            f"<b>Каналов:</b> {len(channels)}\n"
-            f"<b>Тегов:</b> {len(keywords)}\n"
-            f"<b>Статус:</b> подключаюсь к каналам",
-            parse_mode="HTML"
-        )
-        
-        total_found = 0
-        channels_processed = 0
-        channels_with_news = 0
-        
-        # Проверяем каждый канал
-        for i, channel in enumerate(channels, 1):
-            try:
-                # Обновляем статус
-                if i % 2 == 0 or i == len(channels):  # Каждые 2 канала или последний
-                    await progress_msg.edit_text(
-                        f"🔍 <b>Проверяю каналы...</b>\n\n"
-                        f"<b>Прогресс:</b> {i}/{len(channels)}\n"
-                        f"<b>Текущий:</b> @{channel}\n"
-                        f"<b>Найдено новостей:</b> {total_found}",
-                        parse_mode="HTML"
-                    )
-                
-                # Получаем сообщения из канала
-                messages = await parser.get_channel_messages(channel)
-                
-                if not messages:
-                    logging.info(f"Не удалось получить сообщения из @{channel}")
-                    continue
-                
-                channels_processed += 1
-                
-                # Фильтруем по времени
-                filtered_messages = parser.filter_messages_by_time(messages, period_hours)
-                
-                if not filtered_messages:
-                    continue
-                
-                # Ищем релевантные новости
-                channel_news_found = 0
-                
-                for msg in filtered_messages:
-                    # Анализируем сообщение
-                    analysis = analyze_message(msg['text'], keywords, negative_keywords)
-                    
-                    if analysis['relevant']:
-                        # Генерируем хеш новости
-                        news_hash = db.generate_news_hash(
-                            msg['text'], 
-                            channel, 
-                            msg.get('id')
-                        )
-                        
-                        # Проверяем, не отправляли ли уже
-                        if not db.is_news_sent(user_id, news_hash):
-                            # Отправляем новость пользователю
-                            await send_news_item(
-                                bot, 
-                                user_id, 
-                                msg, 
-                                analysis['keywords'], 
-                                channel
-                            )
-                            
-                            # Отмечаем как отправленную
-                            db.mark_news_sent(
-                                user_id, 
-                                news_hash, 
-                                channel, 
-                                msg.get('id')
-                            )
-                            
-                            total_found += 1
-                            channel_news_found += 1
-                            
-                            # Пауза между отправками
-                            await asyncio.sleep(0.5)
-                
-                if channel_news_found > 0:
-                    channels_with_news += 1
-                    
-            except Exception as e:
-                logging.error(f"Ошибка проверки канала @{channel}: {e}")
-                continue
-        
-        # Сохраняем историю проверки
-        db.add_check_history(
-            user_id, 
-            period_hours, 
-            channels_processed, 
-            total_found, 
-            success=True
-        )
-        
-        # Формируем итоговое сообщение
-        if total_found > 0:
-            result_text = (
-                f"✅ <b>Проверка завершена!</b>\n\n"
-                f"<b>Период:</b> {period_text}\n"
-                f"<b>Каналов проверено:</b> {channels_processed}/{len(channels)}\n"
-                f"<b>Каналов с новостями:</b> {channels_with_news}\n"
-                f"<b>Найдено новостей:</b> {total_found}\n\n"
-                f"Все новости отправлены вам."
-            )
-        else:
-            result_text = (
-                f"📭 <b>Новых новостей не найдено</b>\n\n"
-                f"<b>Период:</b> {period_text}\n"
-                f"<b>Каналов проверено:</b> {channels_processed}/{len(channels)}\n\n"
-                f"<b>Возможные причины:</b>\n"
-                f"• В выбранный период не было сообщений\n"
-                f"• Сообщения не содержат ваших ключевых слов\n"
-                f"• Каналы могут быть приватными\n"
-                f"• Попробуйте увеличить период поиска"
-            )
-        
-        await progress_msg.edit_text(result_text, parse_mode="HTML")
-        
-        # Закрываем сессию парсера
-        await parser.close_session()
-    
-    async def send_news_item(bot: Bot, user_id: int, message: Dict, 
-                           found_keywords: List[str], channel: str):
-        """Отправка одной новости"""
-        try:
-            # Обрезаем текст если слишком длинный
-            news_text = message['text']
-            if len(news_text) > 3500:
-                news_text = news_text[:3500] + "..."
-            
-            # Форматируем время
-            time_str = ""
-            if message.get('timestamp'):
-                time_str = message['timestamp'].strftime("%d.%m.%Y %H:%M")
-            
-            # Формируем сообщение
-            message_text = f"📰 <b>@{channel}</b>\n\n"
-            
-            if time_str:
-                message_text += f"<i>📅 {time_str}</i>\n\n"
-            
-            message_text += f"{news_text}\n\n"
-            
-            if found_keywords:
-                message_text += f"🔍 <b>Найдены теги:</b> {', '.join(found_keywords[:3])}\n"
-            
-            if message.get('url'):
-                message_text += f"\n🔗 <a href='{message['url']}'>Читать в канале</a>"
-            
-            await bot.send_message(
-                chat_id=user_id,
-                text=message_text,
-                parse_mode="HTML",
-                disable_web_page_preview=False
-            )
-            
-        except Exception as e:
-            logging.error(f"Ошибка отправки новости: {e}")
-    
-    @dp.callback_query(F.data.startswith("remove_channel:"))
-    async def callback_remove_channel(callback: types.CallbackQuery):
-        """Удаление канала через кнопку"""
-        try:
-            channel = callback.data.split(":")[1]
-            user_id = callback.from_user.id
-            
-            # Удаляем канал из базы
-            if db.remove_channel(user_id, channel):
-                # Обновляем сообщение
-                await callback.message.edit_text(
-                    f"✅ Канал @{channel} удален\n\n"
-                    f"Остальные каналы остались без изменений.\n\n"
-                    f"Чтобы добавить новый канал, нажмите '➕ Добавить канал'",
-                    parse_mode="HTML"
-                )
-            else:
-                await callback.message.edit_text(
-                    f"❌ Канал @{channel} не найден или уже удален",
-                    parse_mode="HTML"
-                )
-            
-        except Exception as e:
-            logging.error(f"Ошибка удаления канала: {e}")
-            await callback.message.edit_text("❌ Ошибка при удалении канала")
-        
-        await callback.answer()
-    
-    @dp.message(F.text == "📊 Статистика")
-    async def cmd_stats(message: Message):
-        """Статистика пользователя"""
-        user_id = message.from_user.id
-        stats = db.get_user_stats(user_id)
-        channels = db.get_channels(user_id)
-        keywords, negative = db.get_keywords(user_id)
-        
-        stats_text = f"📊 <b>Ваша статистика</b>\n\n"
-        stats_text += f"<b>Каналов:</b> {stats['channels']}\n"
-        stats_text += f"<b>Ключевых слов:</b> {stats['keywords']}\n"
-        stats_text += f"<b>Исключений:</b> {stats['negative']}\n"
-        stats_text += f"<b>Получено новостей:</b> {stats['news_received']}\n\n"
-        
-        if stats['last_check']:
-            check_time, period_hours, news_found = stats['last_check']
-            check_time_str = datetime.strptime(check_time, "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y %H:%M")
-            period_text = format_period_text(period_hours)
-            stats_text += f"<b>Последняя проверка:</b>\n"
-            stats_text += f"• Время: {check_time_str}\n"
-            stats_text += f"• Период: {period_text}\n"
-            stats_text += f"• Найдено: {news_found} нов.\n\n"
-        
-        if channels:
-            stats_text += f"<b>Ваши каналы:</b>\n"
-            for i, channel in enumerate(channels[:5], 1):
-                stats_text += f"{i}. @{channel}\n"
-            if len(channels) > 5:
-                stats_text += f"... и еще {len(channels) - 5}\n"
-        
-        await message.answer(stats_text, parse_mode="HTML")
-    
-    @dp.message(F.text == "📢 Мои каналы")
-    async def cmd_my_channels(message: Message):
-        """Показать каналы пользователя с пагинацией"""
-        user_id = message.from_user.id
-        
-        # Получаем первую страницу каналов
-        data = db.get_channels_paginated(user_id, page=1, per_page=8)
-        
-        if not data['channels']:
-            await message.answer(
-                "📭 <b>У вас нет каналов</b>\n\n"
-                "Добавьте каналы через кнопку '➕ Добавить канал'\n\n"
-                "<b>Популярные IT каналы:</b>\n"
-                "@ru_tech, @tproger, @vcnews, @ainewsru",
-                parse_mode="HTML"
-            )
-            return
-        
-        # Создаем кнопки для каналов (максимум 8 на страницу)
-        buttons = []
-        for channel in data['channels']:
-            buttons.append([
-                InlineKeyboardButton(
-                    text=f"📢 @{channel}",
-                    url=f"https://t.me/{channel}"
-                ),
-                InlineKeyboardButton(
-                    text="🗑️ Удалить",
-                    callback_data=f"remove_channel:{channel}"
-                )
-            ])
-        
-        # Добавляем кнопки пагинации, если есть несколько страниц
-        navigation_buttons = []
-        
-        if data['total_pages'] > 1:
-            if data['page'] > 1:
-                navigation_buttons.append(
-                    InlineKeyboardButton(text="⬅️ Назад", callback_data=f"channels_page:{data['page'] - 1}")
-                )
-            
-            # Показываем номер страницы
-            navigation_buttons.append(
-                InlineKeyboardButton(text=f"{data['page']}/{data['total_pages']}", callback_data="noop")
-            )
-            
-            if data['page'] < data['total_pages']:
-                navigation_buttons.append(
-                    InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"channels_page:{data['page'] + 1}")
-                )
-            
-            buttons.append(navigation_buttons)
-        
-        # Кнопка для проверки этих каналов
-        buttons.append([
-            InlineKeyboardButton(
-                text="🔍 Проверить эти каналы",
-                callback_data="check_my_channels"
-            )
+        # Форматируем ответ с весами
+        keywords_text = "\n".join([
+            f"• {escape_html(kw)}: <code>{weight:.1f}</code>" for kw, weight in weighted_keywords
         ])
         
-        start_num = (data['page'] - 1) * data['per_page'] + 1
-        end_num = start_num + len(data['channels']) - 1
+        await state.clear()
         
         await message.answer(
-            f"📢 <b>Ваши каналы</b> ({data['total']} всего)\n"
-            f"📄 Страница {data['page']}/{data['total_pages']}\n"
-            f"📋 Показаны: {start_num}-{end_num}\n\n"
-            f"Нажмите на название для перехода\n"
-            f"Или удалите ненужные:",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+            f"✅ <b>Весовые ключевые слова обновлены!</b>\n\n"
+            f"<b>Новый список ({len(weighted_keywords)} слов):</b>\n"
+            f"{keywords_text}\n\n"
+            f"<i>Теперь поиск будет учитывать важность каждого слова</i>",
+            parse_mode=ParseMode.HTML
         )
-    
-    @dp.callback_query(F.data == "check_my_channels")
-    async def callback_check_my_channels(callback: types.CallbackQuery):
-        """Проверка текущих каналов"""
-        await callback.message.edit_text(
-            "🔍 <b>За какой период проверять эти каналы?</b>",
-            parse_mode="HTML",
-            reply_markup=get_period_keyboard()
-        )
-        await callback.answer()
-    
-    @dp.message(F.text == "🏷️ Мои теги")
-    async def cmd_my_tags(message: Message):
-        """Показать и настроить теги"""
-        user_id = message.from_user.id
-        keywords, negative = db.get_keywords(user_id)
         
-        # Если нет тегов - значения по умолчанию
-        if not keywords:
-            keywords = ["технологии", "программирование", "стартап"]
-        
-        keywords_text = ", ".join(keywords) if keywords else "не заданы"
-        negative_text = ", ".join(negative) if negative else "не заданы"
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✏️ Изменить теги", callback_data="edit_keywords"),
-                InlineKeyboardButton(text="🚫 Изменить исключения", callback_data="edit_negative")
-            ],
-            [
-                InlineKeyboardButton(text="🔄 По умолчанию", callback_data="reset_tags_default")
-            ]
-        ])
-        
+    except Exception as e:
         await message.answer(
-            f"🏷️ <b>Ваши теги и фильтры</b>\n\n"
-            f"<b>🔍 Ключевые слова:</b>\n"
-            f"<code>{keywords_text}</code>\n\n"
-            f"<b>🚫 Слова-исключения:</b>\n"
-            f"<code>{negative_text}</code>\n\n"
-            f"<b>Как работает:</b>\n"
-            f"1. Бот ищет сообщения с ключевыми словами\n"
-            f"2. Игнорирует сообщения с исключениями\n"
-            f"3. Отправляет вам только релевантное",
-            parse_mode="HTML",
-            reply_markup=keyboard
+            f"❌ <b>Ошибка обработки</b>\n\n"
+            f"Проверьте формат ввода\n"
+            f"<b>Пример:</b> <code>технологии:2.0, программирование:1.5</code>",
+            parse_mode=ParseMode.HTML
         )
-    
-    @dp.callback_query(F.data == "edit_keywords")
-    async def callback_edit_keywords(callback: types.CallbackQuery, state: FSMContext):
-        """Редактирование ключевых слов"""
-        await callback.message.answer(
-            "✏️ <b>Введите новые ключевые слова:</b>\n\n"
-            "<b>Формат:</b> слова через запятую\n"
-            "<b>Пример:</b> технологии, программирование, стартап\n\n"
-            "Текущие теги будут заменены.",
-            parse_mode="HTML"
-        )
-        await state.set_state(UserStates.waiting_for_keywords)
-        await callback.answer()
 
-    @dp.callback_query(F.data == "edit_negative")
-    async def callback_edit_negative(callback: types.CallbackQuery, state: FSMContext):
-        """Редактирование исключений"""
-        await callback.message.answer(
-            "🚫 <b>Введите слова-исключения:</b>\n\n"
-            "<b>Формат:</b> слова через запятую\n"
-            "<b>Пример:</b> смерть, авария, преступление\n\n"
-            "Текущие исключения будут заменены.",
-            parse_mode="HTML"
-        )
-        await state.set_state(UserStates.waiting_for_negative)
-        await callback.answer()
-
-    @dp.callback_query(F.data == "reset_tags_default")
-    async def callback_reset_tags_default(callback: types.CallbackQuery):
-        """Сброс тегов к значениям по умолчанию"""
-        user_id = callback.from_user.id
-        
-        # Устанавливаем значения по умолчанию
-        default_keywords = ["технологии", "программирование", "стартап", "инвестиции"]
-        default_negative = ["смерть", "авария", "преступление", "война"]
-        
-        db.set_keywords(user_id, default_keywords, is_negative=False)
-        db.set_keywords(user_id, default_negative, is_negative=True)
-        
-        await callback.message.edit_text(
-            f"🔄 <b>Теги сброшены к значениям по умолчанию</b>\n\n"
-            f"<b>Ключевые слова:</b>\n"
-            f"<code>{', '.join(default_keywords)}</code>\n\n"
-            f"<b>Исключения:</b>\n"
-            f"<code>{', '.join(default_negative)}</code>",
-            parse_mode="HTML"
-        )
-        await callback.answer()
+@router.message(UserStates.waiting_for_negative)
+async def process_negative_input(message: Message, state: FSMContext):
+    """Обработка ввода исключений"""
+    raw_keywords = [word.strip() for word in message.text.split(',')]
+    negative = [word for word in raw_keywords if word and len(word) >= 2]
     
-    @dp.message(F.text == "➕ Добавить канал")
-    async def cmd_add_channel(message: Message):
-        """Добавление нового канала"""
+    if not negative:
         await message.answer(
-            "➕ <b>Добавление канала</b>\n\n"
-            "Отправьте username канала:\n"
-            "<code>@username</code>\n\n"
-            "<b>Или выберите из популярных:</b>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="@ru_tech", callback_data="quick_add:ru_tech"),
-                    InlineKeyboardButton(text="@tproger", callback_data="quick_add:tproger")
-                ],
-                [
-                    InlineKeyboardButton(text="@vcnews", callback_data="quick_add:vcnews"),
-                    InlineKeyboardButton(text="@ainewsru", callback_data="quick_add:ainewsru")
-                ],
-                [
-                    InlineKeyboardButton(text="@roem", callback_data="quick_add:roem"),
-                    InlineKeyboardButton(text="@digital", callback_data="quick_add:digital")
-                ]
-            ])
+            "❌ <b>Не найдено слов-исключений</b>\n\n"
+            "Введите хотя бы одно слово\n"
+            "<b>Пример:</b> смерть, авария, война",
+            parse_mode=ParseMode.HTML
         )
+        return
     
-    @dp.callback_query(F.data.startswith("quick_add:"))
-    async def callback_quick_add(callback: types.CallbackQuery):
-        """Быстрое добавление канала"""
-        channel = callback.data.split(":")[1]
-        user_id = callback.from_user.id
-        
-        if db.add_channel(user_id, f"@{channel}"):
-            await callback.message.edit_text(
-                f"✅ Канал @{channel} добавлен!\n\n"
-                f"Теперь настройте теги и проверьте новости.",
-                parse_mode="HTML"
-            )
-        else:
-            await callback.message.edit_text(f"ℹ️ Канал @{channel} уже добавлен")
-        
-        await callback.answer()
-        
-    @dp.callback_query(F.data.startswith("channels_page:"))
-    async def callback_channels_page(callback: types.CallbackQuery):
-        """Обработка переключения страниц с каналами"""
-        try:
-            page = int(callback.data.split(":")[1])
-            user_id = callback.from_user.id
-            
-            # Получаем данные для страницы
-            data = db.get_channels_paginated(user_id, page=page, per_page=8)
-            
-            # Создаем кнопки для каналов
-            buttons = []
-            for channel in data['channels']:
-                buttons.append([
-                    InlineKeyboardButton(
-                        text=f"📢 @{channel}",
-                        url=f"https://t.me/{channel}"
-                    ),
-                    InlineKeyboardButton(
-                        text="🗑️ Удалить",
-                        callback_data=f"remove_channel:{channel}"
-                    )
-                ])
-            
-            # Добавляем кнопки пагинации
-            navigation_buttons = []
-            
-            if data['total_pages'] > 1:
-                if data['page'] > 1:
-                    navigation_buttons.append(
-                        InlineKeyboardButton(text="⬅️ Назад", callback_data=f"channels_page:{data['page'] - 1}")
-                    )
-                
-                navigation_buttons.append(
-                    InlineKeyboardButton(text=f"{data['page']}/{data['total_pages']}", callback_data="noop")
-                )
-                
-                if data['page'] < data['total_pages']:
-                    navigation_buttons.append(
-                        InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"channels_page:{data['page'] + 1}")
-                    )
-                
-                buttons.append(navigation_buttons)
-            
-            # Кнопка для проверки этих каналов
-            buttons.append([
-                InlineKeyboardButton(
-                    text="🔍 Проверить эти каналы",
-                    callback_data="check_my_channels"
-                )
-            ])
-            
-            start_num = (data['page'] - 1) * data['per_page'] + 1
-            end_num = start_num + len(data['channels']) - 1
-            
-            await callback.message.edit_text(
-                f"📢 <b>Ваши каналы</b> ({data['total']} всего)\n"
-                f"📄 Страница {data['page']}/{data['total_pages']}\n"
-                f"📋 Показаны: {start_num}-{end_num}\n\n"
-                f"Нажмите на название для перехода\n"
-                f"Или удалите ненужные:",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-            )
-            
-        except ValueError:
-            await callback.answer("❌ Ошибка пагинации")
-        except Exception as e:
-            logging.error(f"Ошибка переключения страниц: {e}")
-            await callback.answer("❌ Ошибка при загрузке страницы")
-        
-        await callback.answer()
+    user_id = message.from_user.id
+    db.set_keywords(user_id, negative, is_negative=True)
+    await state.clear()
     
-    # Пустой обработчик для кнопки-заглушки
-    @dp.callback_query(F.data == "noop")
-    async def callback_noop(callback: types.CallbackQuery):
-        """Обработчик для неактивных кнопок"""
-        await callback.answer()
-    
-    @dp.message(F.text.startswith("@"))
-    async def handle_direct_channel_input(message: Message):
-        """Обработка прямого ввода @канала"""
-        channel = message.text
-        user_id = message.from_user.id
+    await message.answer(
+        f"✅ <b>Слова-исключения обновлены!</b>\n\n"
+        f"<b>Новый список ({len(negative)} слов):</b>\n"
+        f"<code>{escape_html(', '.join(negative))}</code>\n\n"
+        f"<i>Сообщения с этими словами теперь будут игнорироваться</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+# ==================== ОБРАБОТКА ПРОЧИХ СООБЩЕНИЙ ====================
+
+@router.message()
+async def handle_other_messages(message: Message):
+    """Обработка прочих сообщений"""
+    # Если сообщение похоже на username канала
+    text = message.text.strip()
+    if re.match(r'^@[a-zA-Z0-9_]{5,}$', text):
+        # Используем FSMContext из сообщения
+        from aiogram.fsm.context import FSMContext
+        from aiogram.fsm.storage.memory import MemoryStorage
         
-        if db.add_channel(user_id, channel):
-            await message.answer(
-                f"✅ Канал {channel} добавлен!\n\n"
-                f"Теперь настройте теги через '🏷️ Мои теги'\n"
-                f"И проверьте новости через '🔍 Проверить новости'",
-                parse_mode="HTML"
-            )
-        else:
-            await message.answer(f"ℹ️ Канал {channel} уже добавлен")
+        storage = MemoryStorage()
+        fsm_context = FSMContext(storage=storage, key=f"fsm:{message.from_user.id}")
+        await handle_channel_input(message, fsm_context)
+        return
     
-    @dp.message(F.text == "⚙️ Настройки")
-    async def cmd_settings(message: Message):
-        """Настройки бота"""
-        settings_text = (
-            "⚙️ <b>Настройки бота</b>\n\n"
-            "<b>Текущий режим:</b> Telegram Web парсинг\n"
-            "<b>Ограничения:</b>\n"
-            "• Только публичные каналы\n"
-            "• До ~50 последних сообщений\n"
-            "• Задержка между запросами\n\n"
-            "<b>Рекомендации:</b>\n"
-            "• Добавляйте публичные каналы\n"
-            "• Используйте точные ключевые слова\n"
-            "• Проверяйте новости раз в несколько часов"
+    # Помощь по непонятным командам
+    if len(text) < 50:  # Только для коротких сообщений
+        await message.answer(
+            "🤖 <b>Я не понял команду</b>\n\n"
+            "Используйте кнопки меню или команды:\n"
+            "/start - Начало работы\n"
+            "/help - Помощь\n"
+            "/channels - Мои каналы\n"
+            "/tags - Мои теги\n\n"
+            "Или отправьте @username канала для добавления",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_keyboard()
         )
-        
-        await message.answer(settings_text, parse_mode="HTML")
+
+# ==================== ЗАПУСК ====================
+
+async def main():
+    logger.info("🚀 Улучшенный бот запущен и готов к работе!")
     
-    @dp.message(Command("help"))
-    async def cmd_help(message: Message):
-        """Справка по боту"""
-        help_text = (
-            "<b>📖 Помощь по боту</b>\n\n"
-            
-            "<b>🎯 Основной процесс:</b>\n"
-            "1. Добавьте каналы (кнопка '➕ Добавить канал')\n"
-            "2. Настройте теги (кнопка '🏷️ Мои теги')\n"
-            "3. Проверьте новости (кнопка '🔍 Проверить новости')\n"
-            "4. Выберите период проверки\n\n"
-            
-            "<b>🔍 Как работает проверка:</b>\n"
-            "1. Бот получает сообщения из каналов\n"
-            "2. Фильтрует по выбранному периоду\n"
-            "3. Ищет ваши ключевые слова\n"
-            "4. Исключает сообщения с запрещенными словами\n"
-            "5. Отправляет вам уникальные новости\n\n"
-            
-            "<b>🏷️ Пример тегов:</b>\n"
-            "• Ключевые: технологии, программирование, стартап\n"
-            "• Исключения: смерть, авария, преступление\n\n"
-            
-            "<b>📅 Доступные периоды:</b>\n"
-            "• 1-24 часа\n"
-            "• 1-7 дней\n"
-            "• Вся история (все доступные сообщения)\n\n"
-            
-            "<b>⚠️ Ограничения:</b>\n"
-            "• Только публичные каналы\n"
-            "• Не все каналы доступны через web\n"
-            "• Ограниченная история сообщений"
+    # Инициализация базы данных
+    try:
+        cleaned = db.cleanup_old_news(days=30)
+        logger.info(f"✅ База данных инициализирована. Очищено {cleaned} старых записей")
+    except Exception as e:
+        logger.error(f"Ошибка инициализации БД: {e}")
+    
+    # Создаем бота и диспетчер
+    bot = Bot(token=config.BOT_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+    
+    # Инициализируем менеджер очереди
+    global news_queue
+    news_queue = NewsQueueManager(bot)
+    news_queue.set_bot(bot)
+    
+    # Запускаем обработчик очереди в фоне
+    queue_task = None
+    try:
+        queue_task = asyncio.create_task(
+            news_queue.process_queue(
+                batch_size=config.SEND_BATCH_SIZE,
+                delay=config.SEND_DELAY
+            )
         )
-        
-        await message.answer(help_text, parse_mode="HTML")
-    
-    @dp.message(Command("test_channel"))
-    async def cmd_test_channel(message: Message, command: CommandObject):
-        """Тестовая команда для проверки канала"""
-        if not command.args:
-            await message.answer("Укажите канал: /test_channel @username")
-            return
-        
-        channel = command.args.strip().lstrip('@')
-        await message.answer(f"🔍 Тестирую канал @{channel}...")
-        
-        try:
-            messages = await parser.get_channel_messages(channel, limit=10)
-            
-            if messages:
-                result = f"✅ Канал @{channel} доступен\n\n"
-                result += f"Найдено сообщений: {len(messages)}\n"
-                result += f"Последнее сообщение:\n"
-                result += f"• Время: {messages[0].get('timestamp', 'неизвестно')}\n"
-                result += f"• Длина: {len(messages[0]['text'])} символов\n"
-                result += f"• ID: {messages[0].get('id', 'нет')}\n\n"
-                result += "Можно добавить этот канал!"
-            else:
-                result = f"❌ Канал @{channel} не доступен\n\n"
-                result += "Возможные причины:\n"
-                result += "• Канал приватный\n"
-                result += "• Ошибка подключения\n"
-                result += "• Канал не существует"
-            
-            await message.answer(result)
-            
-        except Exception as e:
-            await message.answer(f"❌ Ошибка: {str(e)[:100]}")
-        
-        finally:
-            await parser.close_session()
-    
-    # ==================== ЗАПУСК БОТА ====================
-    
-    logger.info("✅ Бот запущен с Telegram Web парсингом!")
+        logger.info("🚀 Обработчик очереди запущен")
+    except Exception as e:
+        logger.error(f"Ошибка запуска обработчика очереди: {e}")
     
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    except Exception as e:
+        logger.error(f"Ошибка при запуске polling: {e}")
+        raise
     finally:
-        # Закрываем соединения при остановке
-        await parser.close_session()
+        # Останавливаем обработчик очереди
+        if news_queue:
+            news_queue.stop_processing()
+            if queue_task:
+                try:
+                    await queue_task
+                except Exception as e:
+                    logger.error(f"Ошибка при остановке очереди: {e}")
+        
+        try:
+            await parser.close_session()
+        except Exception as e:
+            logger.error(f"Ошибка при закрытии сессии парсера: {e}")
+        
+        try:
+            await bot.session.close()
+        except Exception as e:
+            logger.error(f"Ошибка при закрытии сессии бота: {e}")
+        
+        logger.info("👋 Бот остановлен")
 
 if __name__ == "__main__":
     asyncio.run(main())
