@@ -41,6 +41,7 @@ class UserStates(StatesGroup):
     waiting_for_keywords = State()
     waiting_for_negative = State()
     waiting_for_channel = State()
+    waiting_for_channels_batch = State()  # Новое состояние для пакетного добавления каналов
 
 # Вспомогательные функции
 def escape_html(text: str) -> str:
@@ -55,7 +56,7 @@ class NewsFormatter:
     def format_news_card(msg: Dict, found_keywords: List[str] = None) -> str:
         """Форматирование новости в виде карточки с указанием ключевых слов и файлов"""
         # Если нет текста, используем заголовок по умолчанию
-        if msg['text']:
+        if msg.get('text'):
             title = NewsFormatter._extract_title(msg['text'])
         else:
             title = "Сообщение с файлом"
@@ -141,7 +142,7 @@ class NewsFormatter:
             parts.append("\n")
         
         # Основной текст (если есть)
-        if msg['text']:
+        if msg.get('text'):
             excerpt = msg['text'][:300].strip()
             if len(msg['text']) > 300:
                 excerpt += "..."
@@ -155,6 +156,26 @@ class NewsFormatter:
         
         return "".join(parts)
 
+    @staticmethod
+    def _extract_title(text: str) -> str:
+        """Извлечение заголовка из текста"""
+        if not text:
+            return "Сообщение с файлом"
+        
+        # Берем первую строку или первые 50 символов
+        lines = text.strip().split('\n')
+        first_line = lines[0].strip()
+        
+        if not first_line:
+            if len(text) > 50:
+                return text[:50].strip() + "..."
+            return text.strip()
+        
+        if len(first_line) > 80:
+            return first_line[:80].strip() + "..."
+        
+        return first_line
+
 # Класс для анализа релевантности
 class RelevanceAnalyzer:
     """Анализатор релевантности с поддержкой специального тега $файл"""
@@ -164,7 +185,7 @@ class RelevanceAnalyzer:
                        negative_keywords: List[str], 
                        has_file: bool = False) -> Dict:
         """Анализ сообщения с поддержкой $файл (логика ИЛИ)"""
-        text_lower = f" {text.lower()} "
+        text_lower = f" {text.lower()} " if text else " "
         
         # Проверяем наличие специального тега $файл
         has_file_keyword = "$файл" in keywords or "$file" in keywords
@@ -179,23 +200,25 @@ class RelevanceAnalyzer:
             if keyword in ["$файл", "$file"]:
                 continue
             
-            # Ищем слово как отдельное
+            # Проверяем наличие слова в тексте
+            # Ищем слово как отдельное (с пробелами по бокам)
             if f" {keyword_lower} " in text_lower:
                 found_keywords.append(keyword)
-            # Или как часть слова
-            elif keyword_lower in text_lower:
+            # Или как часть слова (если текст короткий)
+            elif keyword_lower in text_lower and len(keyword_lower) >= 3:
                 found_keywords.append(keyword)
         
         # Проверяем, релевантно ли сообщение по тексту
         relevant_by_text = len(found_keywords) > 0
         
         # Проверяем, релевантно ли сообщение по файлу
+        # Если есть тег $файл И в сообщении есть файл
         relevant_by_file = has_file_keyword and has_file
         
-        # Сообщение релевантно если:
+        # Важное изменение: сообщение релевантно если:
         # 1. Есть обычные ключевые слова ИЛИ
         # 2. Есть $файл в ключевых словах И есть файл в сообщении
-        # (Логика ИЛИ, а не И)
+        # (Логика ИЛИ, а не И - исправлено)
         is_relevant = relevant_by_text or relevant_by_file
         
         # Если сообщение релевантно по файлу, добавляем $файл в найденные ключевые слова
@@ -206,7 +229,7 @@ class RelevanceAnalyzer:
         found_negative = []
         for neg_keyword in negative_keywords:
             neg_lower = neg_keyword.lower()
-            if f" {neg_lower} " in text_lower or neg_lower in text_lower:
+            if text and (f" {neg_lower} " in text_lower or neg_lower in text_lower):
                 found_negative.append(neg_keyword)
         
         return {
@@ -220,57 +243,56 @@ class RelevanceAnalyzer:
             'relevant_by_file': relevant_by_file
         }
 
-# Класс для управления очередью отправки
-class NewsQueueManager:
-    """Менеджер очереди отправки новостей"""
+# Вспомогательные функции для обработки каналов
+def extract_channels_from_text(text: str) -> List[str]:
+    """Извлечение каналов из текста (каждая строка - отдельный канал)"""
+    # Разделяем по переносам строк
+    lines = text.strip().split('\n')
+    potential_channels = []
     
-    def __init__(self, bot: Bot = None):
-        self.queue = asyncio.Queue()
-        self.processing = False
-        self.bot = bot
-    
-    def set_bot(self, bot: Bot):
-        """Установить бота"""
-        self.bot = bot
-    
-    async def add_news_batch(self, user_id: int, news_items: List[Dict]):
-        """Добавление партии новостей в очередь"""
-        if not news_items or not self.bot:
-            return
+    for line in lines:
+        # Удаляем лишние пробелы
+        line = line.strip()
+        if not line:
+            continue
         
-        for item in news_items:
-            try:
-                news_item = item['news_item']
-                
-                # Форматируем сообщение
-                message_text = NewsFormatter.format_news_card(news_item['message'])
-                
-                # Отправляем сообщение
-                await self.bot.send_message(
-                    chat_id=user_id,
-                    text=message_text,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=False
-                )
-                
-                # Отмечаем как отправленное
-                db.mark_news_sent(
-                    user_id, 
-                    news_item['hash'], 
-                    news_item['message']['channel'],
-                    news_item['message'].get('id')
-                )
-                
-                # Пауза между сообщениями
-                await asyncio.sleep(0.2)
-                
-            except Exception as e:
-                logger.error(f"Ошибка отправки новости: {e}")
-                continue
+        # Удаляем символ @ если есть в начале
+        if line.startswith('@'):
+            line = line[1:]
+        
+        # Проверяем валидность username
+        if re.match(r'^[a-zA-Z0-9_]{5,32}$', line):
+            potential_channels.append('@' + line)
     
-    def stop_processing(self):
-        """Остановка обработки очереди"""
-        self.processing = False
+    return potential_channels
+
+async def process_channels_batch(user_id: int, channels: List[str]) -> Dict:
+    """Обработка пакета каналов"""
+    results = {
+        'added': [],
+        'already_exists': [],
+        'failed': [],
+        'total': len(channels)
+    }
+    
+    for channel in channels:
+        # Проверяем существование канала
+        exists, info = await parser.check_channel_exists(channel)
+        
+        if not exists:
+            results['failed'].append((channel, info))
+            continue
+        
+        # Добавляем канал
+        if db.add_channel(user_id, channel):
+            results['added'].append(channel)
+        else:
+            results['already_exists'].append(channel)
+        
+        # Пауза между проверками каналов
+        await asyncio.sleep(0.3)
+    
+    return results
 
 # Клавиатуры
 def get_main_keyboard() -> ReplyKeyboardMarkup:
@@ -279,7 +301,8 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="🔍 Проверить новости"), KeyboardButton(text="📊 Статистика")],
             [KeyboardButton(text="📢 Мои каналы"), KeyboardButton(text="🏷️ Мои теги")],
-            [KeyboardButton(text="➕ Добавить канал"), KeyboardButton(text="❓ Помощь")]
+            [KeyboardButton(text="➕ Добавить канал"), KeyboardButton(text="➕➕ Добавить несколько каналов")],
+            [KeyboardButton(text="❓ Помощь")]
         ],
         resize_keyboard=True,
         input_field_placeholder="Выберите действие..."
@@ -353,10 +376,12 @@ async def cmd_start(message: Message):
     if not channels:
         await message.answer(
             "🎯 <b>Быстрый старт:</b>\n\n"
-            "1. Отправьте @username канала\n"
+            "1. Добавьте каналы (можно несколько сразу)\n"
             "2. Настройте теги\n"
             "3. Проверьте новости\n\n"
-            "<i>Пример канала:</i> <code>@tproger</code>",
+            "<i>Можете добавить несколько каналов сразу, каждый с новой строки:</i>\n"
+            "<code>tproger\nvcru\nroem_news</code>\n\n"
+            "<i>Символ @ добавляется автоматически</i>",
             parse_mode=ParseMode.HTML
         )
 
@@ -377,8 +402,11 @@ async def cmd_channels(message: Message):
             "📭 <b>У вас еще нет каналов</b>\n\n"
             "Добавьте каналы одним из способов:\n"
             "1. Через кнопку «➕ Добавить канал»\n"
-            "2. Отправьте @username канала\n"
-            "3. Пример: <code>@tproger</code>",
+            "2. Через кнопку «➕➕ Добавить несколько каналов»\n"
+            "3. Отправьте username канала\n"
+            "4. Пример (каждый с новой строки):\n"
+            "<code>tproger\nvcru\nroem_news</code>\n\n"
+            "<i>Символ @ добавляется автоматически</i>",
             parse_mode=ParseMode.HTML
         )
         return
@@ -415,7 +443,9 @@ async def cmd_tags(message: Message):
         f"<b>🚫 Слова-исключения:</b>\n"
         f"<code>{escape_html(negative_text)}</code>\n\n"
         f"<i>Бот будет искать сообщения с ключевыми словами,\n"
-        f"но без слов-исключений.</i>",
+        f"но без слов-исключений.</i>\n\n"
+        f"<i>🔹 Специальный тег <code>$файл</code>: показывает сообщения с файлами\n"
+        f"   (логика ИЛИ: ключевые слова ИЛИ файлы)</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=get_settings_keyboard()
     )
@@ -434,6 +464,135 @@ async def cmd_stats_command(message: Message):
     
     await message.answer(stats_text, parse_mode=ParseMode.HTML)
 
+# ==================== ОБРАБОТКА ВВОДА КАНАЛОВ ====================
+
+@router.message(F.text.startswith("@"))
+async def handle_channel_input(message: Message, state: FSMContext):
+    """Обработка ввода канала (один или несколько)"""
+    text = message.text.strip()
+    user_id = message.from_user.id
+    
+    # Проверяем, если это многострочный ввод
+    if '\n' in text:
+        # Это несколько каналов
+        channels = extract_channels_from_text(text)
+        
+        if not channels:
+            await message.answer(
+                "❌ <b>Не найдено валидных каналов</b>\n\n"
+                "Username канала должен:\n"
+                "• Содержать только буквы, цифры и _\n"
+                "• Быть от 5 до 32 символов\n\n"
+                "<b>Примеры многострочного ввода:</b>\n"
+                "<code>tproger\nvcru\nroem_news</code>\n\n"
+                "<i>Каждый канал с новой строки</i>\n"
+                "<i>Символ @ добавляется автоматически</i>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        # Обрабатываем несколько каналов
+        processing_msg = await message.answer(
+            f"🔄 <b>Обрабатываю {len(channels)} каналов...</b>\n\n"
+            f"<i>Пожалуйста, подождите...</i>",
+            parse_mode=ParseMode.HTML
+        )
+        
+        results = await process_channels_batch(user_id, channels)
+        
+        # Формируем результат
+        result_text = f"📊 <b>Результат добавления каналов</b>\n\n"
+        result_text += f"<b>Всего обработано:</b> {results['total']}\n"
+        
+        if results['added']:
+            result_text += f"<b>✅ Успешно добавлено:</b> {len(results['added'])}\n"
+            for i, channel in enumerate(results['added'][:5], 1):
+                result_text += f"  {i}. {channel}\n"
+            if len(results['added']) > 5:
+                result_text += f"  ... и еще {len(results['added']) - 5}\n"
+        
+        if results['already_exists']:
+            result_text += f"\n<b>ℹ️ Уже были добавлены:</b> {len(results['already_exists'])}\n"
+            for i, channel in enumerate(results['already_exists'][:3], 1):
+                result_text += f"  {i}. {channel}\n"
+        
+        if results['failed']:
+            result_text += f"\n<b>❌ Не удалось добавить:</b> {len(results['failed'])}\n"
+            for i, (channel, reason) in enumerate(results['failed'][:3], 1):
+                result_text += f"  {i}. {channel} - {reason}\n"
+        
+        result_text += f"\n<b>Итого каналов:</b> {len(db.get_all_channels(user_id))}"
+        
+        await processing_msg.delete()
+        await message.answer(result_text, parse_mode=ParseMode.HTML)
+        
+    else:
+        # Это один канал
+        channel = text
+        
+        # Добавляем @ если нет
+        if not channel.startswith('@'):
+            channel = '@' + channel
+        
+        # Проверяем формат
+        if not re.match(r'^@[a-zA-Z0-9_]{5,32}$', channel):
+            await message.answer(
+                "❌ <b>Некорректный формат</b>\n\n"
+                "Username канала должен:\n"
+                "• Содержать только буквы, цифры и _\n"
+                "• Быть от 5 до 32 символов\n\n"
+                "<b>Примеры:</b>\n"
+                "<code>tproger</code> - один канал\n"
+                "<code>tproger\nvcru\nroem_news</code> - несколько каналов\n\n"
+                "<i>Символ @ добавляется автоматически</i>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        # Проверяем существование канала
+        await message.answer(f"🔍 Проверяю канал {channel}...")
+        
+        exists, info = await parser.check_channel_exists(channel)
+        
+        if not exists:
+            await message.answer(
+                f"❌ <b>Не удалось добавить канал</b>\n\n"
+                f"<b>Причина:</b> {info}\n\n"
+                f"<i>Убедитесь что канал публичный и username указан правильно</i>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        # Добавляем канал
+        if db.add_channel(user_id, channel):
+            response = (
+                f"✅ <b>Канал {channel} успешно добавлен!</b>\n\n"
+                f"{info}\n\n"
+            )
+            
+            # Проверяем настройки пользователя
+            keywords, _ = db.get_keywords(user_id)
+            if not keywords:
+                response += (
+                    f"💡 <b>Совет:</b> Настройте ключевые слова для поиска\n"
+                    f"Используйте «🏷️ Мои теги» → «✏️ Изменить теги»\n\n"
+                    f"<i>Без ключевых слов бот не будет находить релевантные новости</i>"
+                )
+            else:
+                response += (
+                    f"Теперь можете проверить новости через «🔍 Проверить новости»"
+                )
+            
+            await message.answer(response, parse_mode=ParseMode.HTML)
+        else:
+            await message.answer(
+                f"ℹ️ Канал {channel} уже был добавлен ранее\n\n"
+                f"Используйте «📢 Мои каналы» для просмотра списка",
+                parse_mode=ParseMode.HTML
+            )
+    
+    await state.clear()
+
 # ==================== КНОПКИ ====================
 
 @router.message(F.text == "🔍 Проверить новости")
@@ -446,7 +605,7 @@ async def cmd_check_news(message: Message):
         await message.answer(
             "❌ <b>У вас нет каналов для проверки</b>\n\n"
             "Добавьте хотя бы один канал через\n"
-            "кнопку «➕ Добавить канал»",
+            "кнопку «➕ Добавить канал» или «➕➕ Добавить несколько каналов»",
             parse_mode=ParseMode.HTML
         )
         return
@@ -482,7 +641,7 @@ async def cmd_check_news(message: Message):
             for msg in messages:
                 # Анализируем с учетом файлов
                 analysis = RelevanceAnalyzer.analyze_message(
-                    msg['text'],
+                    msg.get('text', ''),
                     keywords,
                     negative,
                     has_file=msg.get('has_file', False)
@@ -495,7 +654,7 @@ async def cmd_check_news(message: Message):
                         if age.days > 7:
                             continue
                     
-                    news_hash = db.generate_news_hash(msg['text'], channel, msg.get('id'))
+                    news_hash = db.generate_news_hash(msg.get('text', ''), channel, msg.get('id'))
                     
                     if not db.is_news_sent(user_id, news_hash):
                         # Получаем найденные ключевые слова
@@ -588,85 +747,38 @@ async def cmd_check_news(message: Message):
     
     await message.answer(result_text, parse_mode=ParseMode.HTML)
 
-@router.message(F.text.startswith("@"))
-async def handle_channel_input(message: Message, state: FSMContext):
-    """Обработка ввода канала"""
-    channel = message.text.strip()
-    user_id = message.from_user.id
-    
-    # Проверяем формат
-    if not re.match(r'^@[a-zA-Z0-9_]{5,32}$', channel):
-        await message.answer(
-            "❌ <b>Некорректный формат</b>\n\n"
-            "Username канала должен:\n"
-            "• Начинаться с @\n"
-            "• Содержать только буквы, цифры и _\n"
-            "• Быть от 5 до 32 символов\n\n"
-            "<b>Пример:</b> <code>@tproger</code>",
-            parse_mode=ParseMode.HTML
-        )
-        return
-    
-    # Проверяем существование канала
-    await message.answer(f"🔍 Проверяю канал {channel}...")
-    
-    exists, info = await parser.check_channel_exists(channel)
-    
-    if not exists:
-        await message.answer(
-            f"❌ <b>Не удалось добавить канал</b>\n\n"
-            f"<b>Причина:</b> {info}\n\n"
-            f"<i>Убедитесь что канал публичный и username указан правильно</i>",
-            parse_mode=ParseMode.HTML
-        )
-        return
-    
-    # Добавляем канал
-    if db.add_channel(user_id, channel):
-        response = (
-            f"✅ <b>Канал {channel} успешно добавлен!</b>\n\n"
-            f"{info}\n\n"
-        )
-        
-        # Проверяем настройки пользователя
-        keywords, _ = db.get_keywords(user_id)
-        if not keywords:
-            response += (
-                f"💡 <b>Совет:</b> Настройте ключевые слова для поиска\n"
-                f"Используйте «🏷️ Мои теги» → «✏️ Изменить теги»\n\n"
-                f"<i>Без ключевых слов бот не будет находить релевантные новости</i>"
-            )
-        else:
-            response += (
-                f"Теперь можете проверить новости через «🔍 Проверить новости»"
-            )
-        
-        await message.answer(response, parse_mode=ParseMode.HTML)
-    else:
-        await message.answer(
-            f"ℹ️ Канал {channel} уже был добавлен ранее\n\n"
-            f"Используйте «📢 Мои каналы» для просмотра списка",
-            parse_mode=ParseMode.HTML
-        )
-    
-    await state.clear()
-
 @router.message(F.text == "➕ Добавить канал")
 async def cmd_add_channel(message: Message, state: FSMContext):
     """Добавление канала"""
     await message.answer(
         "➕ <b>Добавление канала</b>\n\n"
-        "Отправьте username канала в формате:\n"
-        "<code>@username</code>\n\n"
-        "<b>Примеры:</b>\n"
-        "<code>@tproger</code> - канал о программировании\n"
-        "<code>@vcru</code> - Venture Capital\n"
-        "<code>@roem_news</code> - IT новости\n\n"
-        "<i>💡 Совет: Добавьте тег <code>$файл</code> в ключевые слова,\n"
-        "чтобы получать сообщения с файлами (фото, видео, документы)</i>",
+        "Отправьте username канала:\n\n"
+        "<b>Можно ввести:</b>\n"
+        "• Один канал: <code>tproger</code>\n"
+        "• Несколько каналов, каждый с новой строки:\n"
+        "<code>tproger\nvcru\nroem_news</code>\n\n"
+        "<i>💡 Символ @ добавляется автоматически</i>\n"
+        "<i>💡 Можно добавлять как с @, так и без него</i>",
         parse_mode=ParseMode.HTML
     )
     await state.set_state(UserStates.waiting_for_channel)
+
+@router.message(F.text == "➕➕ Добавить несколько каналов")
+async def cmd_add_channels_batch(message: Message, state: FSMContext):
+    """Добавление нескольких каналов сразу"""
+    await message.answer(
+        "➕➕ <b>Добавление нескольких каналов</b>\n\n"
+        "Отправьте список каналов (каждый с новой строки):\n\n"
+        "<b>Формат:</b>\n"
+        "<code>tproger\nvcru\nroem_news</code>\n\n"
+        "<b>Пример:</b>\n"
+        "<code>tproger\nvcru\nroem_news\nstartup_insider</code>\n\n"
+        "<i>💡 Можно добавить много каналов за раз</i>\n"
+        "<i>💡 Каждый канал с новой строки</i>\n"
+        "<i>💡 Символ @ добавляется автоматически</i>",
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(UserStates.waiting_for_channels_batch)
 
 @router.message(F.text == "📢 Мои каналы")
 async def cmd_my_channels(message: Message):
@@ -697,7 +809,11 @@ async def callback_edit_keywords(callback: CallbackQuery, state: FSMContext):
         "✏️ <b>Введите ключевые слова:</b>\n\n"
         "<b>Формат:</b> слова через запятую\n"
         "<b>Пример:</b> технологии, программирование, стартап, инвестиции\n\n"
-        "<i>Бот будет искать эти слова в сообщениях</i>",
+        "<i>💡 Специальный тег <code>$файл</code>:</i>\n"
+        "<i>Добавьте этот тег, чтобы получать сообщения с файлами</i>\n"
+        "<i>(фото, видео, документы и т.д.)</i>\n\n"
+        "<i>Логика поиска: ИЛИ</i>\n"
+        "<i>Показываются сообщения с ключевыми словами ИЛИ файлами</i>",
         parse_mode=ParseMode.HTML
     )
     await state.set_state(UserStates.waiting_for_keywords)
@@ -788,7 +904,10 @@ async def callback_how_it_works(callback: CallbackQuery):
         "3. <b>Фильтрация</b> - отбрасывает сообщения со словами-исключениями\n"
         "4. <b>Проверка повторов</b> - не показывает уже отправленные новости\n"
         "5. <b>Отправка</b> - отправляет подходящие сообщения вам\n\n"
-        "<i>Поиск учитывает границы слов и регистр не важен</i>",
+        "<i>📌 Логика поиска:</i>\n"
+        "<i>• Если есть тег <code>$файл</code>: показываются сообщения с ключевыми словами ИЛИ файлами</i>\n"
+        "<i>• Без тега <code>$файл</code>: показываются только сообщения с ключевыми словами</i>\n\n"
+        "<i>💡 Каждое сообщение помечается, по какой причине оно было найдено</i>",
         parse_mode=ParseMode.HTML
     )
 
@@ -831,6 +950,7 @@ async def process_keywords_input(message: Message, state: FSMContext):
         )
     else:
         response += (
+            f"<i>Бот будет показывать только сообщения с ключевыми словами</i>\n"
             f"<i>Теперь проверьте новости через «🔍 Проверить новости»</i>"
         )
     
@@ -863,6 +983,134 @@ async def process_negative_input(message: Message, state: FSMContext):
         parse_mode=ParseMode.HTML
     )
 
+@router.message(UserStates.waiting_for_channel)
+async def process_channel_input(message: Message, state: FSMContext):
+    """Обработка ввода канала из состояния waiting_for_channel"""
+    text = message.text.strip()
+    user_id = message.from_user.id
+    
+    # Пытаемся извлечь каналы из текста
+    channels = extract_channels_from_text(text)
+    
+    if not channels:
+        await message.answer(
+            "❌ <b>Не найдено валидных каналов</b>\n\n"
+            "Username канала должен:\n"
+            "• Содержать только буквы, цифры и _\n"
+            "• Быть от 5 до 32 символов\n\n"
+            "<b>Примеры:</b>\n"
+            "• Один канал: <code>tproger</code>\n"
+            "• Несколько каналов:\n"
+            "<code>tproger\nvcru\nroem_news</code>\n\n"
+            "<i>💡 Каждый канал с новой строки</i>\n"
+            "<i>💡 Символ @ добавляется автоматически</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # Обрабатываем каналы
+    processing_msg = await message.answer(
+        f"🔄 <b>Обрабатываю {len(channels)} каналов...</b>\n\n"
+        f"<i>Пожалуйста, подождите...</i>",
+        parse_mode=ParseMode.HTML
+    )
+    
+    results = await process_channels_batch(user_id, channels)
+    
+    # Формируем результат
+    result_text = f"📊 <b>Результат добавления каналов</b>\n\n"
+    result_text += f"<b>Всего обработано:</b> {results['total']}\n"
+    
+    if results['added']:
+        result_text += f"<b>✅ Успешно добавлено:</b> {len(results['added'])}\n"
+        for i, channel in enumerate(results['added'][:5], 1):
+            result_text += f"  {i}. {channel}\n"
+        if len(results['added']) > 5:
+            result_text += f"  ... и еще {len(results['added']) - 5}\n"
+    
+    if results['already_exists']:
+        result_text += f"\n<b>ℹ️ Уже были добавлены:</b> {len(results['already_exists'])}\n"
+        for i, channel in enumerate(results['already_exists'][:3], 1):
+            result_text += f"  {i}. {channel}\n"
+    
+    if results['failed']:
+        result_text += f"\n<b>❌ Не удалось добавить:</b> {len(results['failed'])}\n"
+        for i, (channel, reason) in enumerate(results['failed'][:3], 1):
+            result_text += f"  {i}. {channel} - {reason}\n"
+    
+    result_text += f"\n<b>Итого каналов:</b> {len(db.get_all_channels(user_id))}"
+    
+    await processing_msg.delete()
+    await message.answer(result_text, parse_mode=ParseMode.HTML)
+    await state.clear()
+
+@router.message(UserStates.waiting_for_channels_batch)
+async def process_channels_batch_input(message: Message, state: FSMContext):
+    """Обработка ввода нескольких каналов из состояния waiting_for_channels_batch"""
+    text = message.text.strip()
+    user_id = message.from_user.id
+    
+    if not text:
+        await message.answer(
+            "❌ <b>Пустое сообщение</b>\n\n"
+            "Отправьте список каналов, каждый с новой строки",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # Извлекаем каналы из текста
+    channels = extract_channels_from_text(text)
+    
+    if not channels:
+        await message.answer(
+            "❌ <b>Не найдено валидных каналов</b>\n\n"
+            "Username канала должен:\n"
+            "• Содержать только буквы, цифры и _\n"
+            "• Быть от 5 до 32 символов\n\n"
+            "<b>Пример правильного формата:</b>\n"
+            "<code>tproger\nvcru\nroem_news</code>\n\n"
+            "<i>💡 Каждый канал с новой строки</i>\n"
+            "<i>💡 Символ @ добавляется автоматически</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # Обрабатываем каналы
+    processing_msg = await message.answer(
+        f"🔄 <b>Обрабатываю {len(channels)} каналов...</b>\n\n"
+        f"<i>Пожалуйста, подождите...</i>",
+        parse_mode=ParseMode.HTML
+    )
+    
+    results = await process_channels_batch(user_id, channels)
+    
+    # Формируем результат
+    result_text = f"📊 <b>Результат добавления каналов</b>\n\n"
+    result_text += f"<b>Всего обработано:</b> {results['total']}\n"
+    
+    if results['added']:
+        result_text += f"<b>✅ Успешно добавлено:</b> {len(results['added'])}\n"
+        for i, channel in enumerate(results['added'][:10], 1):
+            result_text += f"  {i}. {channel}\n"
+        if len(results['added']) > 10:
+            result_text += f"  ... и еще {len(results['added']) - 10}\n"
+    
+    if results['already_exists']:
+        result_text += f"\n<b>ℹ️ Уже были добавлены:</b> {len(results['already_exists'])}\n"
+        for i, channel in enumerate(results['already_exists'][:5], 1):
+            result_text += f"  {i}. {channel}\n"
+    
+    if results['failed']:
+        result_text += f"\n<b>❌ Не удалось добавить:</b> {len(results['failed'])}\n"
+        for i, (channel, reason) in enumerate(results['failed'][:5], 1):
+            result_text += f"  {i}. {channel} - {reason}\n"
+    
+    result_text += f"\n<b>Итого каналов:</b> {len(db.get_all_channels(user_id))}"
+    
+    await processing_msg.delete()
+    await message.answer(result_text, parse_mode=ParseMode.HTML)
+    await state.clear()
+
 # ==================== ЗАПУСК ====================
 
 async def main():
@@ -880,18 +1128,12 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     
-    # Создаем менеджер очереди
-    news_queue = NewsQueueManager(bot)
-    
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     except Exception as e:
         logger.error(f"Ошибка при запуске polling: {e}")
         raise
     finally:
-        # Останавливаем обработчик очереди
-        news_queue.stop_processing()
-        
         try:
             await parser.close_session()
         except Exception as e:
